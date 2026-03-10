@@ -20,6 +20,9 @@ World → Perception Manager → STM (Muninn) → Sagax → Orchestrator → Wor
                │                    │
              Exilis               Logos
           (triage gate)         (async consolidation)
+                                     │
+                              staging/ scan
+                              install affirmed
                                      ↓
                                LTM (Muninn)
                           Skills · Procedures · Tools
@@ -31,13 +34,11 @@ World → Perception Manager → STM (Muninn) → Sagax → Orchestrator → Wor
 | **Exilis** | < 70 ms | Reads the STM window (consN + new events). One small LLM call per poll cycle. Emits `ignore` / `act` / `urgent`. Nothing else. |
 | **Sagax** | 1–30 s | Recall-driven reasoning. Reads STM context, queries the Hot Task Manager, searches Muninn for capabilities, produces structured output via the Narrator token stream. Updates consN. |
 | **Orchestrator** | < 50 ms | Routing bridge. No cognitive logic. Runs perception pipelines, routes the Narrator stream to TTS, tools, UI, and HTM. Enforces session permissions. Issues nudges. |
-| **Logos** | Minutes → days | Background consolidation. Reads raw STM events, writes durable LTM. Synthesises skills from repeated successful execution traces. Owns STM flush. |
+| **Logos** | Minutes → days | Background consolidation. Reads raw STM events, writes durable LTM. Synthesises skills. Scans staging directory for new tools. Installs affirmed tool files. Owns STM flush. |
 
 ---
 
 ## How It Feels
-
-Before describing the machinery, here is what Huginn makes possible.
 
 ### Handling an interruption without losing your place
 
@@ -52,23 +53,21 @@ Artux doesn't freeze, stall, or lose the lighting job. Instead:
 - Sagax pivots, reads John's calendar, and answers the question.
 - John says *"Thanks."* Sagax reads the HTM — lighting task is still waiting — and resumes: *"Back to your movie setup — closing the blinds now."*
 
-The lighting task never restarted from scratch. The calendar question didn't require a new session or a context reset. Both threads ran cleanly, tracked in parallel through the task manager.
-
-This is what the HTM enables: Sagax can hold multiple threads of work simultaneously, park them on interruption, and resume from exactly where it left off — even if STM has been flushed or a consN compression has run in between.
-
 ### Knowing who you're talking to — and what they're allowed to do
 
 Artux doesn't ask you to log in. When John walks into the room and speaks, the Perception Manager captures his voiceprint, runs it against the entity registry, and confirms his identity through signature matching. This confirmation flows into the Orchestrator as the active session's `entity_id`.
 
-From that identity, Artux knows what John is allowed to do. Session grants are attached to entities:
+From that identity, Artux knows what John is allowed to do — his profile grants lighting, kettle, and calendar read access, denies the camera, and requires verbal confirmation for calendar writes. Unknown speakers are treated as guests with restricted access until Logos can confirm or archive their identity.
 
-- John's profile gives Artux access to his calendar, the smart lighting, and the kettle.
-- The camera is denied — John has explicitly opted out of visual perception.
-- Home assistant commands require verbal confirmation before execution.
+### Discovering and installing new tools
 
-When a second person, Sam, enters the room, the Perception Manager captures an unrecognised voiceprint. Sam is an implied entity — Artux heard someone it doesn't know yet. It holds the voiceprint as a partial identity in the Hot Task Manager's active session cache, accumulates evidence (voice pattern, position, what Sam says about herself) and waits. If Sam introduces herself — *"Hi, I'm Sam"* — Sagax links the name claim to the voiceprint, updates the implied entity, and the next time Sam returns, the Perception Manager will resolve her immediately.
+You drop a Python file into `tools/staging/`. On its next maintenance cycle (every 5 minutes by default), Logos scans the directory, reads the tool's manifest, and writes a discovery event to STM. Sagax notices it and, at the next natural pause in conversation, tells John:
 
-Until Sam is confirmed, Artux treats her as a guest with restricted access. It won't read out private calendar entries or actuate personal devices — it doesn't know who Sam is. Identity is authority. Authority is scope.
+*"I found a new tool in the staging directory — it's called Smart Kettle Control. It can boil water and set a specific temperature. It needs kettle permission and requires the `tplink-smarthome-api` package. Want me to install it? It's also capable of running as a background sensor pipeline — would you like it active by default?"*
+
+John says *"Yes to both."* Sagax notes the affirmation in the HTM task. Logos installs it on the next cycle — pip-installing the dependency, loading the module, registering the handler, writing the LTM artifact, and optionally activating it as a perception pipeline.
+
+If John says *"Actually, install it now,"* Sagax calls `request_early_logos_cycle` and Logos runs immediately.
 
 ---
 
@@ -112,6 +111,7 @@ Until Sam is confirmed, Artux treats her as a guest with restricted access. It w
 │               │  ┌───────────────────────────────┐                    │   │
 │               │  │            Logos               │◄── raw events      │   │
 │               │  │  consolidation · skill synth   │                    │   │
+│               │  │  staging scan · tool install   │                    │   │
 │               │  └───────────────────────────────┘                    │   │
 │               └────────────────────────────────────────────────────── ┘   │
 │                                       │ consolidate_ltm()                  │
@@ -125,66 +125,126 @@ Until Sam is confirmed, Artux treats her as a guest with restricted access. It w
 
 ---
 
-## Key Design Decisions
+## Adding a New Tool
 
-### All cognitive decisions are LLM calls
+This is the most common task. There are two paths.
 
-No hardcoded classifiers, rule engines, or heuristics anywhere in the stack. Every triage decision, every narrative update, every plan, every consolidation, every skill evaluation is an LLM call. Exilis uses a ≤1B model for speed. Sagax uses a 3–13B model. Logos uses the largest available. The models are different; the principle is not.
+### Path A: Operator registration (startup)
 
-### Perception pipelines are skills — and HTM tasks
+Write the descriptor to Muninn LTM and register the Python handler at startup. Use this for tools that ship with the system or are installed by the operator before first boot.
 
-A perception pipeline is a `class_type: "pipeline"` skill artifact with fully prefilled arguments. There is no LLM insertion between pipeline steps; the Orchestrator executes tool chains mechanically. When a pipeline step needs a value that varies at runtime, it must come from the previous step's output — not from inference.
+```python
+from huginn.runtime.tool_manager import register_tool
 
-Every active pipeline runs as an HTM task with `initiated_by: "system"`. The Orchestrator supervises it by querying HTM. Failures are logged to the task notebook. Sagax and Logos see pipeline state through the same HTM interface they use for everything else — no separate supervision mechanism.
-
-Pipeline parameters have two change surfaces: **LTM meta** (durable, Logos-managed — e.g. Logos notices ASR degrades in the kitchen and writes a noise profile) and **HTM task notebook** (session-scoped — Sagax adjusts mic sensitivity mid-session). Logos can promote notebook observations to LTM meta post-session, closing the adaptation loop.
-
-### Exilis sees the world through Sagax's eyes
-
-There is exactly one `consN` and Sagax is its sole author. Exilis reads the same rolling narrative for triage context. Using the same model and the same consN means Exilis triages as Sagax would — no incoherence between the attention gate and the reasoning agent.
-
-Exilis batches all available new events into a single LLM call per 5 ms poll cycle. If five events arrive in 20 ms, Exilis makes one call covering all five. Target total latency: < 70 ms.
-
-### HTM: multi-tasking without context collision
-
-The **Hot Task Manager** is a dual-surface store that lets Sagax hold multiple threads of work simultaneously without them colliding in STM.
-
-**Surface 1 — ActiveSessionCache (ASC):** Per-session, ephemeral. Holds the session workbook (complete stream mirror), active entities, recently-used tools, and active recall results. Sagax queries it on demand — it's not pushed wholesale at wake-up. The workbook lets Sagax resume a paused task without re-executing confirmed steps.
-
-**Surface 2 — Tasks:** Durable. Survives STM flush, consN compression, and session restart. Each task has a notebook (running commentary), a `resume_at` pointer, and a `persistence` flag. When Sagax is interrupted mid-skill, it writes a `<task_update>` block, parks the task, and picks up the new request. When it returns, it reads the HTM, finds the parked task, checks the workbook for the last confirmed step, and continues from there — not from the beginning.
-
-### consN is lossy by design
-
-Sagax maintains a single rolling narrative (`consN`) that compresses older events as new ones arrive. It is intentionally lossy — approximate timestamps, merged repetition, smoothed detail. It is Sagax's private contextual shorthand, not a record of truth.
-
-`consN` has three load-bearing properties:
-1. **Single object.** There is never more than one. Each update replaces the previous version entirely.
-2. **Triggers ASC garbage collection.** A consN update is a session boundary: stale topics, recalls, and tools are pruned from the cache. Unresolved implied entities are **never pruned** — they linger until Logos resolves them.
-3. **Invisible to Logos.** Logos reads raw events. Building LTM from consN would compound lossiness across every consolidation pass.
-
-### Identity is authority
-
-Artux does not maintain a login system. Identity is established through **signature matching** — voiceprint, faceprint, or device ID — handled entirely by the Perception Manager.
-
-When a known entity is confirmed, the Orchestrator opens a session with that entity's pre-configured grants:
-
-```
-permission_scope:       [microphone, lights, kettle, calendar.read]
-denied:                 [camera, email.send]
-confirmation_required:  [calendar.write, file.delete]
+register_tool(muninn, huginn.tool_manager, {
+    "tool_id":            "tool.set_ceiling_lights.v1",
+    "title":              "Set ceiling lights",
+    "capability_summary": "Control ceiling ambient lighting — mood, wakeup, movie scenes.",
+    "polarity":           "write",
+    "permission_scope":   ["lights.ceiling"],
+    "inputs": {
+        "colour":     {"type": "string",  "description": "CSS colour name or hex"},
+        "brightness": {"type": "integer", "description": "0–100", "default": 80},
+    },
+    "outputs": {
+        "status": {"type": "string"},
+    },
+}, my_lights_fn)
 ```
 
-Tools that require scopes outside the active grants are blocked at the Orchestrator's permission gate before they ever reach the Tool Manager. Sagax does not manage permissions — it declares what scope a tool needs; the Orchestrator enforces it.
+Sagax discovers it automatically via `recall()` — there is no tool registry to update.
 
-Unknown entities (unresolved voiceprints, unrecognised faces) are treated as guests with restricted access. Their implied identity accumulates evidence in the ASC until Logos can confirm or archive them. Privacy-sensitive tools — cameras, personal calendars, messaging — require a confirmed entity. Artux will not expose personal data to someone it hasn't identified.
+### Path B: Drop-in staging (recommended for new tools at runtime)
 
-### Skills are guidance, not scripts
+Create a Python file with a `HUGINN_MANIFEST` block and drop it into the `tools/staging/` directory. Logos will discover it, surface it to the user through Sagax, and install it after confirmation — without any restart.
 
-When Sagax discovers `skill.set_movie_mood` via `recall()`, it doesn't execute the steps mechanically. It reads the guidance sequence, reasons about each step, fills in arguments, and handles interactive beats — asking John what movie, recalling his lighting preferences, deciding whether to prompt for popcorn.
+**File format:**
 
-Skills are synthesised by Logos from repeated successful Sagax execution traces. The threshold is ≥3 successful runs, ≥0.85 step similarity, 0 failures in the last 5, spread across ≥2 days. New skills require a configurable number of human-confirmed runs before they run unconfirmed.
+```python
+"""
+HUGINN_MANIFEST
+tool_id:            tool.smart_kettle.v1
+title:              Smart Kettle Control
+capability_summary: Boil water or set a target temperature on the smart kettle.
+polarity:           write
+permission_scope:   [kettle]
+inputs:
+  action:        {type: string, enum: [boil, set_temp, cancel]}
+  temperature_c: {type: integer, default: 100}
+outputs:
+  status:        {type: string}
+  current_temp:  {type: number}
+dependencies:
+  - tplink-smarthome-api>=0.7
+perception_capable: false
+handler:            handle
+END_MANIFEST
+"""
 
-Pipelines are the **exception** to this: they have no LLM interpretation and are operator-authored, not synthesised. They run exactly as written.
+def handle(action: str, temperature_c: int = 100) -> dict:
+    """Called by ToolManager on every tool_call to this tool."""
+    # your implementation here
+    ...
+    return {"status": "ok", "current_temp": 100.0}
+```
+
+**Manifest fields:**
+
+| Field | Required | Description |
+|---|---|---|
+| `tool_id` | ✓ | Globally unique. Convention: `tool.<name>.v<N>` |
+| `title` | ✓ | Short human name shown to the user |
+| `capability_summary` | ✓ | One sentence. What Sagax uses to decide when to call this tool. Write it as a recall query answer — *"Use this to..."* |
+| `polarity` | ✓ | `read` — safe for inline aug_call. `write` — must go through permission gate via tool_call. |
+| `permission_scope` | ✓ | List of scope strings. The entity's grants must include all of these. |
+| `inputs` | ✓ | JSON Schema properties dict. Keys match the handler's kwargs. |
+| `outputs` | | JSON Schema properties dict for the return value. |
+| `dependencies` | | `pip install` strings. Logos installs these before loading the module. |
+| `perception_capable` | | If `true`, Sagax will ask whether to activate it as a background perception pipeline. |
+| `handler` | | Name of the callable in the file. Defaults to `handle`. |
+
+**What happens after you drop the file:**
+
+1. Next Logos cycle (≤5 min), the file is scanned and a `tool_discovered` event is written to STM.
+2. Exilis classifies it as `act`. Sagax wakes and reads the pending staging task.
+3. At the next natural pause in conversation, Sagax describes the tool and asks the user for confirmation.
+4. User says yes → Sagax writes `user_affirmed: true` to the HTM task notebook.
+5. Next Logos cycle installs it: pip deps → module load → LTM artifact → handler registration.
+6. Sagax responds: *"Noted, I'll install it on the next maintenance cycle — likely within the next 4 minutes, unless you need it urgently."*
+7. If the user says *"urgent"* or *"now"*: Sagax emits `request_early_logos_cycle` and Logos runs immediately.
+
+After installation, the file is moved from `tools/staging/` to `tools/active/` and Sagax can call the tool immediately.
+
+### Perception pipelines
+
+A tool that runs continuously (audio capture, camera feed, a background sensor) is a perception pipeline. It differs from a regular tool in one way: it runs as a system HTM task, and the Orchestrator executes it on every tick rather than waiting for Sagax to call it.
+
+To register a pipeline explicitly at startup:
+
+```python
+import json
+muninn.consolidate_ltm(
+    narrative = json.dumps({
+        "artifact_type": "skill",
+        "class_type":    "pipeline",
+        "title":         "Voice → STM",
+        "source_type":   "user",
+        "event_type":    "speech",
+        "meta": {"active_by_default": True},
+        "steps": [
+            {"order": 1, "artifact_id": "tool.audio_capture.v1",
+             "args": {"sample_rate": 16000, "channels": 1}},
+            {"order": 2, "artifact_id": "tool.asr.v1",
+             "args": {"model": "whisper-base", "language": "en"}},
+        ],
+    }),
+    class_type = "skill",
+)
+huginn.tools.register("tool.audio_capture.v1", my_capture_fn)
+huginn.tools.register("tool.asr.v1",           my_asr_fn)
+```
+
+If `meta.active_by_default` is `true`, the Orchestrator starts it as an HTM system task on boot. For staged tools with `perception_capable: true`, Sagax will ask the user during installation whether to enable it as a pipeline.
 
 ---
 
@@ -199,7 +259,7 @@ pip install openai anthropic         # at least one LLM backend
 
 ## Quick Start
 
-### Factory setup (recommended)
+### Factory setup
 
 ```python
 from huginn import build_huginn
@@ -213,6 +273,7 @@ huginn = build_huginn(
     fast_model  = "qwen2.5:0.5b",   # Exilis + consN summarise
     sagax_model = "llama3.2",
     logos_model = "llama3.2",
+    staging_dir = "./tools/staging", # optional — defaults to ./tools/staging
 )
 
 huginn.start()
@@ -223,55 +284,12 @@ print(reply)
 ### With an active session
 
 ```python
-from huginn import build_huginn
-from memory_module import MemoryAgent
-
-muninn = MemoryAgent("artux.db")
-
-huginn = build_huginn(
-    muninn       = muninn,
-    llm_backend  = "anthropic",
-    fast_model   = "claude-haiku-4-5-20251001",
-    sagax_model  = "claude-sonnet-4-6",
-    logos_model  = "claude-sonnet-4-6",
-    on_tts_token = lambda token: print(token, end="", flush=True),
-)
-
 huginn.orchestrator.new_session(
     entity_id        = "john",
     permission_scope = ["lights", "kettle", "calendar.read"],
     denied           = ["camera"],
 )
-
 huginn.start()
-```
-
-### Registering a tool
-
-Tools are stored in Muninn LTM. Sagax discovers them via `recall()` — no registry, no hardcoded list.
-
-```python
-import json
-
-huginn.tool_manager.register("tool.set_ceiling_lights.v1", my_lights_fn)
-
-muninn.consolidate_ltm(
-    narrative = json.dumps({
-        "artifact_type":      "tool",
-        "tool_id":            "tool.set_ceiling_lights.v1",
-        "title":              "Set ceiling lights",
-        "capability_summary": "Control ceiling ambient lighting. Use for mood, wakeup, movie scenes.",
-        "polarity":           "write",
-        "permission_scope":   ["lights.ceiling"],
-        "inputs":  {"colour": {"type": "string"}, "brightness": {"type": "int", "default": 80}},
-        "outputs": {"status": {"type": "string"}},
-    }),
-    class_type = "tool",
-)
-
-# Sagax discovers it automatically:
-#   sagax.chat("Set the mood for a Christmas movie")
-#   → recall("mood lighting") → tool.set_ceiling_lights.v1 ✓
 ```
 
 ### Registering an entity with grants
@@ -281,53 +299,15 @@ muninn.create_entity(
     name    = "John",
     content = json.dumps({
         "grants": {
-            "permission_scope":       ["microphone", "lights", "kettle", "calendar.read"],
-            "denied":                 ["camera", "email.send"],
-            "confirmation_required":  ["calendar.write"],
+            "permission_scope":      ["microphone", "lights", "kettle", "calendar.read"],
+            "denied":                ["camera", "email.send"],
+            "confirmation_required": ["calendar.write"],
         },
         "signatures": [
             {"kind": "voiceprint", "embedding": john_voiceprint_embedding},
         ],
     }),
 )
-
-# When John speaks, the Perception Manager matches his voiceprint,
-# confirms his identity, and the Orchestrator opens a session with
-# his grants automatically. No login required.
-```
-
-### Registering a perception pipeline
-
-```python
-muninn.consolidate_ltm(
-    narrative = json.dumps({
-        "artifact_type": "skill",
-        "class_type":    "pipeline",
-        "title":         "Voice → STM",
-        "source_type":   "user",
-        "event_type":    "speech",
-        "meta": {
-            "active_by_default": True,
-        },
-        "steps": [
-            {"order": 1, "artifact_id": "tool.audio_capture.v1",
-             "args": {"sample_rate": 16000, "channels": 1}},
-            {"order": 2, "artifact_id": "tool.asr.v1",
-             "args": {"model": "whisper-base", "language": "en"}},
-            {"order": 3, "artifact_id": "tool.embed_text.v1",
-             "args": {"model": "nomic-embed-text"}},
-        ],
-    }),
-    class_type = "skill",
-)
-
-huginn.tools.register("tool.audio_capture.v1", my_capture_fn)
-huginn.tools.register("tool.asr.v1",           my_asr_fn)
-huginn.tools.register("tool.embed_text.v1",    my_embed_fn)
-
-# The Orchestrator starts this pipeline automatically on boot
-# (meta.active_by_default = True) as a system HTM task.
-# Sagax can pause, resume, or modify it at runtime.
 ```
 
 ---
@@ -340,12 +320,13 @@ huginn.tools.register("tool.embed_text.v1",    my_embed_fn)
 | `sagax_model` | `"llama3.2"` | Sagax planning loop (3–13B recommended) |
 | `logos_model` | `"llama3.2"` | Logos consolidation (larger = better LTM quality) |
 | `logos_interval_s` | `300` | Logos consolidation pass interval (seconds) |
+| `staging_dir` | `"<db_dir>/tools/staging"` | Drop new tool `.py` files here |
+| `active_dir` | `"<db_dir>/tools/active"` | Installed tool files are moved here |
 | `HUGINN_LOGOS_BATCH_SIZE` | `50` | Max raw events per Logos pass |
 | `HUGINN_CONS_N_MIN_NEW` | `8` | New events before consN update becomes eligible |
 | `HUGINN_CONS_N_MAX_NEW` | `20` | New events before consN update is forced |
 | `HUGINN_SKILL_MIN_RUNS` | `3` | Minimum successful runs before skill promotion |
 | `HUGINN_SKILL_MIN_DAYS` | `2` | Minimum days spread for skill promotion |
-| `HUGINN_SKILL_CONFIRM_RUNS` | `2` | Confirmation-required runs for newly synthesised skills |
 | `HUGINN_SIG_THRESHOLD` | `0.88` | Minimum cosine similarity for voiceprint/faceprint match |
 
 ---
@@ -358,15 +339,21 @@ huginn/
 ├── agents/
 │   ├── exilis.py                 Attention gate — poll loop, one LLM triage call
 │   ├── sagax.py                  Planning agent — Narrator stream, HTM, consN
-│   └── logos.py                  Consolidation daemon — LTM synthesis, skill promotion
+│   └── logos.py                  Consolidation daemon — LTM, skill synthesis, tool install
 ├── runtime/
-│   ├── stm.py                    STMStore — STMEvent, consN, logos_watermark
-│   ├── htm.py                    HTM — ActiveSessionCache + Tasks
+│   ├── stm.py                    STMStore — STMEvent, consN, watermark (huginn_* tables)
+│   ├── htm.py                    HTM — ActiveSessionCache + Tasks (SQLite)
 │   ├── perception.py             Perception Manager — pipeline runner, sig resolution
-│   └── orchestrator.py           Routing bridge — token stream, permission gate, nudge
+│   ├── orchestrator.py           Routing bridge — Narrator router, permission gate, nudge
+│   ├── tool_manager.py           Two-tier tool dispatch — memory tools + world tools
+│   └── tool_discovery.py         Staging scanner — manifest parser, install lifecycle
 └── llm/
-    ├── client.py                 Unified LLM client (Ollama + Anthropic), streaming
+    ├── client.py                 Unified LLM client (Ollama + Anthropic)
     └── prompts.py                All system prompts as versioned constants
+
+tools/
+├── staging/                      Drop new tool .py files here
+└── active/                       Installed tools live here
 
 design/
 ├── CognitiveModule.md            Architecture spec v1.0
@@ -376,12 +363,36 @@ design/
 
 ---
 
+## Key Design Decisions
+
+### All cognitive decisions are LLM calls
+
+No hardcoded classifiers, rule engines, or heuristics. Every triage decision, every narrative update, every plan, every consolidation is an LLM call. The models are different sizes; the principle is not.
+
+### Tools are memory artifacts
+
+Tool descriptors live in Muninn LTM. Sagax discovers them via `recall()`. There is no hardcoded registry, no import list, no switch statement. A tool that has never been called has the same discoverability as one called a thousand times.
+
+### Perception pipelines are skills — and HTM tasks
+
+A pipeline is a `class_type: "pipeline"` skill artifact. Steps are executed mechanically by the Orchestrator with no LLM between them. Every active pipeline runs as a system HTM task, so Sagax and Logos see pipeline state through the same interface they use for everything else.
+
+### consN is lossy by design
+
+Sagax maintains one rolling narrative (`consN`) that compresses older events as new ones arrive. It is Sagax's private contextual shorthand — not a record. Logos never reads it; it reads raw events instead.
+
+### Identity is authority
+
+Identity is established through signature matching — voiceprint, faceprint, or device ID. Session grants are per-entity, enforced by the Orchestrator's permission gate. Sagax declares what scope a tool needs; the Orchestrator enforces it.
+
+---
+
 ## Relationship to Muninn
 
 | | Muninn | Huginn |
 |---|---|---|
 | **Does** | Store, retrieve, decay, archive | Perceive, reason, plan, consolidate, learn |
-| **Owns** | STM events, LTM entries, entities, sources | Agent logic, HTM, Narrator, skill synthesis |
+| **Owns** | STM events, LTM entries, entities, sources | Agent logic, HTM, Narrator, skill synthesis, tool install |
 | **Writes LTM** | Never (passive store) | Yes — via Logos only |
 | **Uses `recall()`** | Implements it | Calls it constantly |
 | **Can run alone** | Yes (as a library) | No (requires Muninn) |
@@ -390,21 +401,23 @@ design/
 
 ## Status
 
-Architecture stable. Initial implementation complete.
+Architecture stable. Implementation complete.
 
 - [x] Architecture spec (`design/CognitiveModule.md` v1.0)
 - [x] Orchestrator spec (`design/Orchestrator.md` v1.0)
 - [x] Architecture addendum — P-1, P-3, P-4 resolved (`design/CognitiveModule_Addendum.md`)
-- [x] `llm/client.py` — unified LLM client (Ollama + Anthropic, streaming, JSON mode, tool calling)
-- [x] `llm/prompts.py` — all system prompts as versioned constants
-- [x] `runtime/stm.py` — STMEvent envelope, consN, logos_watermark, flush
-- [x] `runtime/htm.py` — Hot Task Manager (ActiveSessionCache + Tasks, SQLite-backed)
+- [x] `llm/client.py` — unified LLM client (Ollama + Anthropic, streaming, JSON, tool calling)
+- [x] `llm/prompts.py` — all system prompts as versioned constants (includes staging confirmation protocol)
+- [x] `runtime/stm.py` — STMEvent envelope, consN, watermark (huginn_events + huginn_meta tables)
+- [x] `runtime/htm.py` — Hot Task Manager (ASC + Tasks, tags_any/tags_all filtering)
 - [x] `runtime/perception.py` — pipeline runner, signature resolution, STM write
-- [x] `runtime/orchestrator.py` — token stream router, permission gate, nudge, HTM scheduler
-- [x] `agents/exilis.py` — 5 ms poll loop, batched LLM triage call
-- [x] `agents/sagax.py` — planning loop, Narrator stream, consN updates, HTM integration
-- [x] `agents/logos.py` — consolidation daemon, per-segment LTM, skill synthesis, ASC flush
-- [x] `huginn/__init__.py` — `build_huginn()` factory
+- [x] `runtime/orchestrator.py` — token stream router, permission gate, nudge, early-cycle proxy
+- [x] `runtime/tool_manager.py` — two-tier dispatch (memory tools + world tools), dynamic install
+- [x] `runtime/tool_discovery.py` — staging scanner, HUGINN_MANIFEST parser, install lifecycle
+- [x] `agents/exilis.py` — 5 ms poll loop, batched LLM triage
+- [x] `agents/sagax.py` — planning loop, Narrator stream, consN, staging confirmation dialogue
+- [x] `agents/logos.py` — consolidation daemon, skill synthesis, staging scan + tool install, early cycle
+- [x] `huginn/__init__.py` — `build_huginn()` factory with staging dirs wired
 - [ ] Test suite
 - [ ] Async support (`aiosqlite` — push notification replaces Exilis poll loop)
 - [ ] Multi-agent STM write conflict handling (v0.5)

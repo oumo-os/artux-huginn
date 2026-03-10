@@ -16,8 +16,9 @@ Quick start:
 
 from .runtime.stm          import STMStore, STMEvent, ConsN
 from .runtime.htm          import HTM, Task, ActiveSessionCache
-from .runtime.perception   import PerceptionManager, ToolRegistry
-from .runtime.orchestrator import Orchestrator, Session, ToolManager
+from .runtime.perception   import PerceptionManager, ToolRegistry, SessionContext
+from .runtime.orchestrator import Orchestrator, Session
+from .runtime.tool_manager import ToolManager, ToolDescriptor, register_tool
 from .agents.exilis        import Exilis
 from .agents.sagax         import Sagax
 from .agents.logos         import Logos
@@ -27,7 +28,8 @@ __all__ = [
     "STMStore", "STMEvent", "ConsN",
     "HTM", "Task", "ActiveSessionCache",
     "PerceptionManager", "ToolRegistry",
-    "Orchestrator", "Session", "ToolManager",
+    "Orchestrator", "Session",
+    "ToolManager", "ToolDescriptor", "register_tool",
     "Exilis", "Sagax", "Logos",
     "LLMClient", "LLMPool",
     "build_huginn",
@@ -36,24 +38,48 @@ __all__ = [
 
 def build_huginn(
     muninn,
-    llm_backend:  str   = "ollama",
-    fast_model:   str   = "qwen2.5:0.5b",
-    sagax_model:  str   = "llama3.2",
-    logos_model:  str   = "llama3.2",
-    ollama_host:  str   = "http://localhost:11434",
-    anthropic_key: str  = "",
-    temperature:  float = 0.1,
-    timeout_s:    float = 60.0,
+    llm_backend:      str   = "ollama",
+    fast_model:       str   = "qwen2.5:0.5b",
+    sagax_model:      str   = "llama3.2",
+    logos_model:      str   = "llama3.2",
+    ollama_host:      str   = "http://localhost:11434",
+    anthropic_key:    str   = "",
+    temperature:      float = 0.1,
+    timeout_s:        float = 60.0,
     logos_interval_s: float = 300.0,
-    on_tts_token: callable = None,
+    on_tts_token:     callable = None,
     on_ui_projection: callable = None,
+    staging_dir:      str   = "",
+    active_dir:       str   = "",
 ) -> "HuginnInstance":
     """
     Factory: instantiate and wire all Huginn components.
 
-    Returns a HuginnInstance with .orchestrator, .sagax, .logos, .stm, .htm
-    all wired and ready. Call huginn.orchestrator.start() to begin.
+    Parameters
+    ----------
+    staging_dir : str
+        Directory Logos watches for new tool .py files.
+        Defaults to ./tools/staging relative to the DB file location.
+    active_dir : str
+        Directory installed tool files are moved into.
+        Defaults to ./tools/active relative to the DB file location.
+
+    Returns a HuginnInstance. Call huginn.start() to begin.
     """
+    from .runtime.tool_discovery import ToolDiscovery
+    import os
+
+    # Resolve staging/active dirs relative to DB path if not given
+    db_path = (
+        getattr(getattr(muninn, "db", None), "path", None)
+        or getattr(getattr(muninn, "db", None), "db_path", None)
+        or "artux.db"
+    )
+    base = os.path.dirname(os.path.abspath(db_path))
+    if not staging_dir:
+        staging_dir = os.path.join(base, "tools", "staging")
+    if not active_dir:
+        active_dir = os.path.join(base, "tools", "active")
 
     def _llm(model):
         return LLMClient(
@@ -65,24 +91,21 @@ def build_huginn(
             timeout     = timeout_s,
         )
 
-    stm   = STMStore(muninn)
-    htm   = HTM()
-    tools = ToolRegistry()
+    stm          = STMStore(muninn)
+    htm          = HTM()
+    pipeline_tools = ToolRegistry()          # pipeline step handlers (Perception Manager)
+    tool_manager = ToolManager(muninn, htm)  # two-tier: memory + world tools
 
-    session_ctx = Session()
-
-    def _noop():
-        pass
+    _noop = lambda: None
 
     perception = PerceptionManager(
-        stm             = stm,
-        htm             = htm,
-        muninn          = muninn,
-        tools           = tools,
-        session         = session_ctx.as_context() if hasattr(session_ctx, "as_context")
-                          else object(),
-        on_event_written = _noop,   # re-wired after Exilis is created
-        sig_threshold   = 0.88,
+        stm              = stm,
+        htm              = htm,
+        muninn           = muninn,
+        tools            = pipeline_tools,
+        session          = SessionContext(),
+        on_event_written = _noop,            # re-wired after Exilis is created
+        sig_threshold    = 0.88,
     )
 
     fast_llm  = _llm(fast_model)
@@ -90,11 +113,11 @@ def build_huginn(
     logos_llm = _llm(logos_model)
 
     exilis = Exilis(
-        stm            = stm,
-        htm            = htm,
-        llm            = fast_llm,
-        on_act         = _noop,     # re-wired by Orchestrator.start()
-        on_urgent      = _noop,
+        stm             = stm,
+        htm             = htm,
+        llm             = fast_llm,
+        on_act          = _noop,             # re-wired by Orchestrator.start()
+        on_urgent       = _noop,
         poll_interval_s = 0.005,
     )
 
@@ -103,44 +126,49 @@ def build_huginn(
         htm          = htm,
         muninn       = muninn,
         llm          = sagax_llm,
-        orchestrator = None,        # re-wired after Orchestrator is created
+        orchestrator = None,                 # re-wired after Orchestrator is created
     )
 
     logos = Logos(
-        stm        = stm,
-        htm        = htm,
-        muninn     = muninn,
-        llm        = logos_llm,
-        interval_s = logos_interval_s,
+        stm          = stm,
+        htm          = htm,
+        muninn       = muninn,
+        llm          = logos_llm,
+        tool_manager = tool_manager,
+        discovery    = ToolDiscovery(
+            staging_dir = staging_dir,
+            active_dir  = active_dir,
+            stm         = stm,
+            htm         = htm,
+        ),
+        interval_s   = logos_interval_s,
     )
 
-    tool_manager = ToolManager(muninn)
-
     orchestrator = Orchestrator(
-        stm                = stm,
-        htm                = htm,
-        perception         = perception,
-        exilis             = exilis,
-        sagax              = sagax,
-        logos              = logos,
-        tool_manager       = tool_manager,
-        on_tts_token       = on_tts_token,
-        on_ui_projection   = on_ui_projection,
+        stm              = stm,
+        htm              = htm,
+        perception       = perception,
+        exilis           = exilis,
+        sagax            = sagax,
+        logos            = logos,
+        tool_manager     = tool_manager,
+        on_tts_token     = on_tts_token,
+        on_ui_projection = on_ui_projection,
     )
 
     # Wire back-references
-    sagax.orchestrator = orchestrator
-    perception.on_event_written = exilis.on_new_event
+    sagax.orchestrator           = orchestrator
+    perception.on_event_written  = exilis.on_new_event
 
     return HuginnInstance(
-        orchestrator = orchestrator,
-        sagax        = sagax,
-        logos        = logos,
-        exilis       = exilis,
-        stm          = stm,
-        htm          = htm,
-        tools        = tools,
-        tool_manager = tool_manager,
+        orchestrator   = orchestrator,
+        sagax          = sagax,
+        logos          = logos,
+        exilis         = exilis,
+        stm            = stm,
+        htm            = htm,
+        tools          = pipeline_tools,
+        tool_manager   = tool_manager,
     )
 
 
