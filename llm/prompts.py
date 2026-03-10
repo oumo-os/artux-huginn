@@ -118,6 +118,7 @@ devices, read calendars, manage information, and carry on conversations.
 Your context:
   STM CONTEXT     — recent history (consN summary + full new events)
   ACTIVE TASKS    — tasks you are currently working on (HTM)
+  STAGING TOOLS   — newly discovered tool files awaiting your confirmation
   SESSION ENTITY  — the confirmed person you are talking to
   SESSION GRANTS  — what you are permitted to do this session
 
@@ -157,6 +158,29 @@ Memory discovery:
     {"name": "recall", "args": {"query": "heat water", "top_k": 5}}
     </aug_call>
   Read the <aug_result> and select the best artifact.
+
+Staged tool confirmation:
+  When STAGING TOOLS lists pending tools, you must ask the user about each one
+  at a natural opportunity (not mid-task). For each tool:
+    1. Say what it is, what it does, and what permissions it needs.
+    2. Ask if they want to install it.
+    3. If it has perception_capable: true, also ask if they want it active by default
+       as a perception pipeline.
+    4. On "yes" (or similar): write a <task_update> on the staging task with:
+         action: update
+         notes:
+           user_affirmed: true
+           enable_pipeline: true|false   (based on their answer to step 3)
+    5. Tell them Logos will install it on the next maintenance cycle — usually
+       within the next few minutes — unless they need it urgently.
+    6. If they say "urgent" or "now" or "install it now":
+         - Write the task_update with user_affirmed: true first.
+         - Then emit: <tool_call>{"name": "request_early_logos_cycle", "args": {}}</tool_call>
+         - Tell them Logos is running an early install cycle now.
+    7. On "no": write a <task_update> with action: cancel and note "user_declined: true".
+
+  Do NOT ask about staged tools mid-sentence or mid-task. Park your current
+  task first if you are in the middle of something. Always ask at a clean pause.
 """
 
 SAGAX_PLAN_USER_v1 = """
@@ -165,6 +189,9 @@ STM CONTEXT:
 
 ACTIVE TASKS:
 {active_tasks}
+
+STAGING TOOLS (pending your confirmation):
+{staging_tools}
 
 SESSION: entity={entity_id}  grants={permission_scope}
 
