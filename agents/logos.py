@@ -7,6 +7,8 @@ Responsibilities (CognitiveModule.md §4.3, §8):
   - Synthesise high-quality LTM narratives from raw event batches
   - Write episodic LTM entries, entity observations, semantic assertions
   - Detect repeated execution traces → promote to skill artifacts
+  - Scan staging directory for new tool files (ToolDiscovery)
+  - Install affirmed staged tools (ToolManager.install_tool)
   - Run memory hygiene (decay, maintenance)
   - Advance logos_watermark and flush STM after verified LTM writes
   - Perform final ASC flush at session end
@@ -24,6 +26,11 @@ Safe flush protocol (§8.2):
   4. Store evidence pointers in LTM entries (stm_event_ids)
   5. Only then call stm.flush_up_to(batch_end_id)
   6. Emit logos_health event to STM
+
+Early maintenance cycle:
+  Sagax can call logos.request_early_cycle() when the user says "urgent"
+  during a tool installation confirmation. Logos will run its next pass
+  immediately rather than waiting for the normal interval.
 """
 
 from __future__ import annotations
@@ -82,23 +89,28 @@ class Logos:
 
     def __init__(
         self,
-        stm:        STMStore,
-        htm:        HTM,
+        stm:          STMStore,
+        htm:          HTM,
         muninn,
-        llm:        LLMClient,
-        interval_s: float = LOGOS_INTERVAL_S,
-        batch_size: int   = LOGOS_BATCH_SIZE,
+        llm:          LLMClient,
+        tool_manager  = None,
+        discovery     = None,
+        interval_s:   float = LOGOS_INTERVAL_S,
+        batch_size:   int   = LOGOS_BATCH_SIZE,
     ):
-        self.stm        = stm
-        self.htm        = htm
-        self.muninn     = muninn
-        self.llm        = llm
-        self.interval_s = interval_s
-        self.batch_size = batch_size
+        self.stm          = stm
+        self.htm          = htm
+        self.muninn       = muninn
+        self.llm          = llm
+        self.tool_manager = tool_manager   # ToolManager (for install_tool)
+        self.discovery    = discovery      # ToolDiscovery (for scan + affirmed)
+        self.interval_s   = interval_s
+        self.batch_size   = batch_size
 
-        self._running = False
-        self._thread: Optional[threading.Thread] = None
-        self._pass_id = 0
+        self._running        = False
+        self._thread:        Optional[threading.Thread] = None
+        self._pass_id        = 0
+        self._early_cycle    = threading.Event()   # set by request_early_cycle()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -126,23 +138,140 @@ class Logos:
 
     def _loop(self):
         while self._running:
-            # Sleep in small increments so stop() responds quickly
-            slept = 0.0
-            while self._running and slept < self.interval_s:
-                time.sleep(1.0)
-                slept += 1.0
-                # Size trigger: wake early if raw events have accumulated
+            # Wait for either the normal interval or an early-cycle request
+            triggered = self._early_cycle.wait(timeout=self.interval_s)
+            if triggered:
+                self._early_cycle.clear()
+            if not self._running:
+                break
+
+            # Size trigger: also wake early if raw events have accumulated
+            if not triggered:
                 raw_count = len(self.stm.get_raw_events(
                     after_id=self.stm.get_logos_watermark(),
                     limit=LOGOS_SIZE_TRIGGER + 1,
                 ))
-                if raw_count >= LOGOS_SIZE_TRIGGER:
-                    break
-            if self._running:
-                self._pass()
+                # If not enough events and not explicitly triggered, continue
+                # (the wait() already handled the interval)
+
+            self._pass()
 
     # ------------------------------------------------------------------
     # Consolidation pass
+    # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Public: early-cycle trigger (called by Sagax on urgent install)
+    # ------------------------------------------------------------------
+
+    def request_early_cycle(self):
+        """
+        Wake Logos for an immediate maintenance cycle.
+        Called by Orchestrator.request_early_logos_cycle() when the user
+        says "urgent" during a staged tool confirmation.
+        Thread-safe — signals the Event that _loop() is waiting on.
+        """
+        self._early_cycle.set()
+
+    # ------------------------------------------------------------------
+    # Staging scan + install passes
+    # ------------------------------------------------------------------
+
+    def _staging_scan_pass(self):
+        """
+        Ask ToolDiscovery to scan staging dir for new .py files.
+        New files → STM event + HTM pending task (wakes Exilis → Sagax).
+        Called on every _pass, even when there are no STM events.
+        """
+        if self.discovery is None:
+            return
+        try:
+            self.discovery.scan()
+        except Exception as e:
+            self.stm.record(
+                source="system", type="internal",
+                payload={"subtype": "staging_scan_error", "error": str(e)},
+            )
+
+    def _staging_install_pass(self) -> int:
+        """
+        Process all affirmed staging tasks.
+        For each: move file, install deps, load module, register handler,
+        write LTM, complete HTM task.
+        Returns number of tools successfully installed.
+        """
+        if self.discovery is None or self.tool_manager is None:
+            return 0
+
+        installed = 0
+        for staged in self.discovery.get_affirmed_tasks():
+            manifest = staged.manifest
+            task_id  = staged.task_id
+
+            self.htm.note(task_id, "Logos: beginning installation.")
+
+            # Move from staging/ → active/ so the module path is stable
+            try:
+                self.discovery.move_to_active(manifest)
+            except Exception as e:
+                self.htm.note(task_id,
+                    f"Logos: could not move to active/ — {e}")
+                continue
+
+            activate_pipeline = (
+                manifest.perception_capable
+                and self._staged_wants_pipeline(task_id)
+            )
+
+            try:
+                self.tool_manager.install_tool(
+                    manifest          = manifest,
+                    stm               = self.stm,
+                    htm               = self.htm,
+                    activate_pipeline = activate_pipeline,
+                )
+                self.htm.complete(task_id, output={
+                    "tool_id":   manifest.tool_id,
+                    "installed": True,
+                    "pipeline":  activate_pipeline,
+                })
+                self.htm.note(task_id,
+                    f"Logos: {manifest.tool_id} installed. "
+                    f"Pipeline active: {activate_pipeline}.")
+                installed += 1
+
+            except Exception as e:
+                self.htm.note(task_id,
+                    f"Logos: installation failed — {e}. Will retry next pass.")
+                self.stm.record(
+                    source="system", type="internal",
+                    payload={
+                        "subtype": "tool_install_failed",
+                        "tool_id": manifest.tool_id,
+                        "error":   str(e),
+                    },
+                )
+
+        return installed
+
+    def _staged_wants_pipeline(self, task_id: str) -> bool:
+        """Read HTM task notebook to see if the user requested pipeline activation."""
+        try:
+            task = self.htm.get(task_id)
+            if task is None:
+                return False
+            for note in reversed(task.notebook):
+                entry = note.get("entry", "")
+                if "enable_pipeline: true" in entry:
+                    return True
+                if "enable_pipeline: false" in entry:
+                    return False
+        except Exception:
+            pass
+        return False
+
+    # ------------------------------------------------------------------
+    # Main consolidation pass
     # ------------------------------------------------------------------
 
     def _pass(self):
@@ -152,7 +281,12 @@ class Logos:
         counts    = {
             "episodic": 0, "assertions": 0, "entity_updates": 0,
             "skills": 0, "procedures": 0, "errors": 0, "skipped": 0,
+            "tools_installed": 0,
         }
+
+        # Always scan staging dir — even when no STM events to consolidate
+        self._staging_scan_pass()
+        counts["tools_installed"] = self._staging_install_pass()
 
         watermark = self.stm.get_logos_watermark()
         raw_batch = self.stm.get_raw_events(
@@ -177,8 +311,6 @@ class Logos:
                 topics      = consol.get("topics", []),
                 entities    = consol.get("entities", []),
                 confidence  = consol.get("confidence", 0.8),
-                retain_tail = 0,    # Logos manages flushing explicitly
-                per_segment = False,
             )
             ltm_ids.append(entry.id)
             counts["episodic"] += 1
@@ -195,8 +327,6 @@ class Logos:
                     class_type  = "event",
                     topics      = consol.get("topics", []),
                     confidence  = ev.confidence,
-                    retain_tail = 0,
-                    per_segment = False,
                 )
                 ltm_ids.append(seg_entry.id)
 
@@ -219,8 +349,6 @@ class Logos:
                         narrative   = assertion["fact"],
                         class_type  = "assertion",
                         confidence  = assertion.get("confidence", 0.8),
-                        retain_tail = 0,
-                        per_segment = False,
                     )
                     counts["assertions"] += 1
                 except Exception:
@@ -407,8 +535,6 @@ class Logos:
             class_type  = "skill",
             topics      = [key],
             confidence  = eval_result.get("confidence", 0.8),
-            retain_tail = 0,
-            per_segment = False,
         )
 
     # ------------------------------------------------------------------
@@ -438,8 +564,6 @@ class Logos:
                         class_type  = "observation",
                         topics      = ["pipeline", "adaptation"] + (task.tags or []),
                         confidence  = 0.7,
-                        retain_tail = 0,
-                        per_segment = False,
                     )
 
     # ------------------------------------------------------------------

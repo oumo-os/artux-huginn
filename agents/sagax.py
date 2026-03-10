@@ -156,7 +156,7 @@ class Sagax:
     def _cycle(self, signal: WakeSignal):
         """
         One Sagax reasoning cycle:
-          1. Read STM context + HTM tasks
+          1. Read STM context + HTM tasks (including pending staging tasks)
           2. Decide: resume parked task, or handle new event, or idle
           3. Produce Narrator token stream
           4. Update consN if window is large
@@ -165,11 +165,16 @@ class Sagax:
         active_tasks = self.htm.query(
             initiated_by="sagax", state="active|paused|due"
         )
+        # Include pending staging tasks so Sagax knows to ask about them
+        staging_tasks = self.htm.query(
+            tags_any=["tool_staging"], state="waiting"
+        )
 
         # Build user prompt
         user_prompt = SAGAX_PLAN_USER_v1.format(
             stm_context      = _format_stm_context(context),
             active_tasks     = _format_tasks(active_tasks),
+            staging_tools    = _format_staging_tasks(staging_tasks),
             entity_id        = self.entity_id or "unknown",
             permission_scope = ", ".join(self.permission_scope) or "none",
         )
@@ -315,20 +320,23 @@ class Sagax:
         Synchronous single-turn chat. For tests and minimal setups.
         Does not use the Narrator stream grammar — returns plain text.
         """
-        # Write the input to STM
         self.stm.record(
             source="user", type="speech",
             payload={"text": user_input},
         )
 
-        context      = self.stm.get_stm_window()
-        active_tasks = self.htm.query(
+        context       = self.stm.get_stm_window()
+        active_tasks  = self.htm.query(
             initiated_by="sagax", state="active|paused|due"
+        )
+        staging_tasks = self.htm.query(
+            tags_any=["tool_staging"], state="waiting"
         )
 
         user_prompt = SAGAX_PLAN_USER_v1.format(
             stm_context      = _format_stm_context(context),
             active_tasks     = _format_tasks(active_tasks),
+            staging_tools    = _format_staging_tasks(staging_tasks),
             entity_id        = self.entity_id or "unknown",
             permission_scope = ", ".join(self.permission_scope) or "none",
         )
@@ -341,7 +349,6 @@ class Sagax:
         )
         self._messages.append({"role": "assistant", "content": resp.text})
 
-        # Write response to STM as output event
         self.stm.record(
             source="system", type="output",
             payload={"subtype": "speech", "text": resp.text, "status": "complete"},
@@ -396,3 +403,45 @@ def _format_tasks(tasks: list) -> str:
             last = t.notebook[-1]
             lines.append(f"    last note: {last['entry']!r}")
     return "\n".join(lines)
+
+
+def _format_staging_tasks(staging_tasks: list) -> str:
+    """
+    Format pending staging tasks for the SAGAX_PLAN_USER prompt.
+    Each entry shows the tool name, capability summary, permissions,
+    dependencies, and whether it is perception-capable — enough for Sagax
+    to give the user a full picture before asking for confirmation.
+    """
+    if not staging_tasks:
+        return "(none)"
+
+    import json
+    lines = []
+    for t in staging_tasks:
+        try:
+            info = json.loads(t.progress or "{}")
+        except Exception:
+            info = {}
+
+        tool_id    = info.get("tool_id", t.title)
+        polarity   = info.get("polarity", "?")
+        scope      = ", ".join(info.get("permission_scope", [])) or "none"
+        deps       = info.get("deps", [])
+        perc       = info.get("perception_capable", False)
+        src        = info.get("source_file", "")
+
+        lines.append(f"  task_id={t.task_id}")
+        lines.append(f"    tool_id:            {tool_id}")
+        lines.append(f"    polarity:           {polarity}")
+        lines.append(f"    permission_scope:   {scope}")
+        lines.append(f"    perception_capable: {perc}")
+        if deps:
+            lines.append(f"    dependencies:       {', '.join(deps)}")
+        if src:
+            lines.append(f"    source_file:        {src}")
+        if t.notebook:
+            last = t.notebook[-1]
+            lines.append(f"    last note: {last['entry']!r}")
+
+    return "\n".join(lines)
+
