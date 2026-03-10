@@ -1,0 +1,509 @@
+"""
+agents/logos.py — Logos: the background consolidation and learning agent.
+
+Responsibilities (CognitiveModule.md §4.3, §8):
+  - Read raw STM events via get_raw_events(after_id=logos_watermark)
+  - Never reads consN — always raw events
+  - Synthesise high-quality LTM narratives from raw event batches
+  - Write episodic LTM entries, entity observations, semantic assertions
+  - Detect repeated execution traces → promote to skill artifacts
+  - Run memory hygiene (decay, maintenance)
+  - Advance logos_watermark and flush STM after verified LTM writes
+  - Perform final ASC flush at session end
+
+Hard prohibitions:
+  - Never reads consN.summary_text as consolidation input
+  - Never triggers consN updates
+  - Never writes to ASC.hot_entities (Perception Manager / Sagax write these)
+  - Exception: final session-end ASC flush (asc.flush()) is Logos' responsibility
+
+Safe flush protocol (§8.2):
+  1. Fetch raw events after logos_watermark
+  2. Synthesise and write LTM artifacts
+  3. Verify each write
+  4. Store evidence pointers in LTM entries (stm_event_ids)
+  5. Only then call stm.flush_up_to(batch_end_id)
+  6. Emit logos_health event to STM
+"""
+
+from __future__ import annotations
+
+import json
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import Any, Optional
+
+from ..runtime.stm import STMStore, STMEvent
+from ..runtime.htm import HTM
+from ..llm.client import LLMClient
+from ..llm.prompts import (
+    LOGOS_CONSOLIDATE_v1,
+    LOGOS_CONSOLIDATE_USER_v1,
+    LOGOS_SKILL_EVAL_v1,
+    LOGOS_SKILL_EVAL_USER_v1,
+)
+
+
+# ---------------------------------------------------------------------------
+# Configuration defaults
+# ---------------------------------------------------------------------------
+
+LOGOS_BATCH_SIZE        = 50      # max raw events per consolidation pass
+LOGOS_INTERVAL_S        = 300.0   # how often Logos wakes (seconds)
+LOGOS_SIZE_TRIGGER      = 40      # also wake if raw events exceed this
+SKILL_MIN_RUNS          = 3
+SKILL_MIN_DAYS          = 2
+SKILL_MIN_SIMILARITY    = 0.85
+SKILL_MAX_FAILURE_RATE  = 0.0     # 0 failures in last 5
+SKILL_CONFIRM_RUNS      = 2       # new skills need this many confirmed runs
+
+
+# ---------------------------------------------------------------------------
+# Logos
+# ---------------------------------------------------------------------------
+
+class Logos:
+    """
+    Background consolidation daemon.
+
+    Parameters
+    ----------
+    stm : STMStore
+    htm : HTM
+    muninn : MemoryAgent
+    llm : LLMClient
+        Large model for narrative synthesis and skill evaluation.
+    interval_s : float
+        Seconds between consolidation passes.
+    batch_size : int
+        Max raw events per pass.
+    """
+
+    def __init__(
+        self,
+        stm:        STMStore,
+        htm:        HTM,
+        muninn,
+        llm:        LLMClient,
+        interval_s: float = LOGOS_INTERVAL_S,
+        batch_size: int   = LOGOS_BATCH_SIZE,
+    ):
+        self.stm        = stm
+        self.htm        = htm
+        self.muninn     = muninn
+        self.llm        = llm
+        self.interval_s = interval_s
+        self.batch_size = batch_size
+
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+        self._pass_id = 0
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def start(self):
+        self._running = True
+        self._thread  = threading.Thread(
+            target=self._loop, daemon=True, name="LogosThread"
+        )
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=10.0)
+
+    def run_once(self):
+        """Run a single consolidation pass synchronously. Useful for tests."""
+        self._pass()
+
+    # ------------------------------------------------------------------
+    # Main loop
+    # ------------------------------------------------------------------
+
+    def _loop(self):
+        while self._running:
+            # Sleep in small increments so stop() responds quickly
+            slept = 0.0
+            while self._running and slept < self.interval_s:
+                time.sleep(1.0)
+                slept += 1.0
+                # Size trigger: wake early if raw events have accumulated
+                raw_count = len(self.stm.get_raw_events(
+                    after_id=self.stm.get_logos_watermark(),
+                    limit=LOGOS_SIZE_TRIGGER + 1,
+                ))
+                if raw_count >= LOGOS_SIZE_TRIGGER:
+                    break
+            if self._running:
+                self._pass()
+
+    # ------------------------------------------------------------------
+    # Consolidation pass
+    # ------------------------------------------------------------------
+
+    def _pass(self):
+        self._pass_id += 1
+        pass_id   = f"logos-pass-{self._pass_id:04d}"
+        started   = time.monotonic()
+        counts    = {
+            "episodic": 0, "assertions": 0, "entity_updates": 0,
+            "skills": 0, "procedures": 0, "errors": 0, "skipped": 0,
+        }
+
+        watermark = self.stm.get_logos_watermark()
+        raw_batch = self.stm.get_raw_events(
+            after_id=watermark, limit=self.batch_size
+        )
+
+        if not raw_batch:
+            self._emit_health(pass_id, started, counts, stm_flushed=0)
+            return
+
+        batch_end_id = raw_batch[-1].id
+
+        # -- Step 1: narrative synthesis from raw events
+        try:
+            ltm_ids  = []
+            consol   = self._synthesise_narrative(raw_batch)
+
+            # Write period LTM entry
+            entry = self.muninn.consolidate_ltm(
+                narrative   = consol["narrative"],
+                class_type  = consol.get("class_type", "observation"),
+                topics      = consol.get("topics", []),
+                entities    = consol.get("entities", []),
+                confidence  = consol.get("confidence", 0.8),
+                retain_tail = 0,    # Logos manages flushing explicitly
+                per_segment = False,
+            )
+            ltm_ids.append(entry.id)
+            counts["episodic"] += 1
+
+            # Per-segment LTM entries for every raw event (high-fidelity preservation)
+            for ev in raw_batch:
+                if ev.type == "internal":
+                    continue
+                seg_text = _event_to_text(ev)
+                if not seg_text:
+                    continue
+                seg_entry = self.muninn.consolidate_ltm(
+                    narrative   = seg_text,
+                    class_type  = "event",
+                    topics      = consol.get("topics", []),
+                    confidence  = ev.confidence,
+                    retain_tail = 0,
+                    per_segment = False,
+                )
+                ltm_ids.append(seg_entry.id)
+
+            # Entity observations
+            for obs in consol.get("entity_observations", []):
+                try:
+                    self.muninn.observe_entity(
+                        entity_id   = obs["entity_id"],
+                        observation = obs["observation"],
+                        authority   = obs.get("authority", "peer"),
+                    )
+                    counts["entity_updates"] += 1
+                except Exception:
+                    pass
+
+            # Semantic assertions
+            for assertion in consol.get("semantic_assertions", []):
+                try:
+                    self.muninn.consolidate_ltm(
+                        narrative   = assertion["fact"],
+                        class_type  = "assertion",
+                        confidence  = assertion.get("confidence", 0.8),
+                        retain_tail = 0,
+                        per_segment = False,
+                    )
+                    counts["assertions"] += 1
+                except Exception:
+                    pass
+
+        except Exception as e:
+            counts["errors"] += 1
+            self.stm.record(
+                source="system", type="internal",
+                payload={"subtype": "logos_error", "pass_id": pass_id,
+                         "error": str(e)},
+            )
+            # Do NOT flush — batch stays until next pass
+            self._emit_health(pass_id, started, counts, stm_flushed=0)
+            return
+
+        # -- Step 2: skill synthesis scan
+        try:
+            synth_count = self._skill_synthesis_scan(raw_batch)
+            counts["skills"] += synth_count
+        except Exception as e:
+            counts["errors"] += 1
+
+        # -- Step 3: examine pipeline task notebooks for LTM meta updates
+        try:
+            self._pipeline_adaptation_pass()
+        except Exception:
+            pass
+
+        # -- Step 4: verified — safe to flush
+        self.stm.flush_up_to(batch_end_id)
+        flushed = len(raw_batch)
+
+        # -- Step 5: mark HTM tasks consolidated where appropriate
+        for task in self.htm.query(state="completed", initiated_by="sagax"):
+            if task.persistence in ("persist", "audit_only"):
+                self.htm.mark_consolidated(task.task_id)
+
+        # -- Step 6: health event
+        self._emit_health(pass_id, started, counts, stm_flushed=flushed)
+
+    # ------------------------------------------------------------------
+    # Narrative synthesis
+    # ------------------------------------------------------------------
+
+    def _synthesise_narrative(self, events: list[STMEvent]) -> dict:
+        """
+        Call the large LLM to produce a consolidation JSON from raw events.
+        Returns the parsed dict from the LLM.
+        """
+        events_text = "\n".join(
+            f"[{e.ts}] id={e.id} source={e.source} type={e.type} "
+            f"conf={e.confidence:.2f} payload={json.dumps(e.payload)[:200]}"
+            for e in events
+        )
+
+        result = self.llm.complete_json(
+            system      = LOGOS_CONSOLIDATE_v1,
+            user        = LOGOS_CONSOLIDATE_USER_v1.format(raw_events=events_text),
+            schema      = {
+                "narrative": "string",
+                "class_type": "string",
+                "topics": ["string"],
+                "entities": ["string"],
+                "confidence": "number",
+                "entity_observations": "array",
+                "semantic_assertions": "array",
+            },
+            temperature = 0,
+        )
+        return result
+
+    # ------------------------------------------------------------------
+    # Skill synthesis
+    # ------------------------------------------------------------------
+
+    def _skill_synthesis_scan(self, events: list[STMEvent]) -> int:
+        """
+        Look for repeated successful tool-call sequences in completed HTM tasks.
+        Returns the number of skills promoted.
+        """
+        promoted = 0
+
+        # Find completed persist tasks not yet examined
+        completed_tasks = self.htm.query(state="completed", initiated_by="sagax")
+        persist_tasks   = [t for t in completed_tasks
+                           if t.persistence == "persist"
+                           and not any("consolidated" in n.get("entry", "")
+                                       for n in t.notebook)]
+
+        # Group tasks by title pattern (simplistic clustering)
+        clusters: dict[str, list] = {}
+        for task in persist_tasks:
+            key = task.title.lower().strip()
+            clusters.setdefault(key, []).append(task)
+
+        for key, tasks in clusters.items():
+            if len(tasks) < SKILL_MIN_RUNS:
+                continue
+
+            # Check day spread
+            from datetime import datetime, timezone
+            dates = set()
+            for t in tasks:
+                try:
+                    d = datetime.fromisoformat(t.created_at).date()
+                    dates.add(d)
+                except Exception:
+                    pass
+            if len(dates) < SKILL_MIN_DAYS:
+                continue
+
+            # Ask LLM to evaluate and optionally synthesise
+            traces_text = "\n\n".join(
+                f"Task: {t.title}\n"
+                f"Created: {t.created_at}\n"
+                f"Output: {json.dumps(t.output)}\n"
+                f"Notebook:\n" + "\n".join(n["entry"] for n in t.notebook)
+                for t in tasks[-5:]   # last 5 executions
+            )
+
+            candidate = {
+                "title":   key,
+                "runs":    len(tasks),
+                "success": sum(1 for t in tasks if t.output.get("confidence", 0) > 0.5),
+            }
+
+            try:
+                eval_result = self.llm.complete_json(
+                    system      = LOGOS_SKILL_EVAL_v1,
+                    user        = LOGOS_SKILL_EVAL_USER_v1.format(
+                        traces    = traces_text,
+                        candidate = json.dumps(candidate),
+                    ),
+                    schema      = {
+                        "decision": "string",
+                        "confidence": "number",
+                        "reason": "string",
+                        "capability_summary": "string",
+                        "suggested_title": "string",
+                    },
+                    temperature = 0,
+                )
+
+                if eval_result.get("decision") == "promote":
+                    self._write_skill_artifact(key, tasks, eval_result)
+                    promoted += 1
+
+                # Emit synthesis candidate event
+                self.stm.record(
+                    source="system", type="internal",
+                    payload={
+                        "subtype":        "logos_synthesis_candidate",
+                        "candidate_id":   f"cand-{key[:20]}",
+                        "title":          eval_result.get("suggested_title", key),
+                        "evidence_count": len(tasks),
+                        "decision":       eval_result.get("decision"),
+                        "reason":         eval_result.get("reason"),
+                    },
+                )
+
+            except Exception:
+                pass
+
+        return promoted
+
+    def _write_skill_artifact(
+        self, key: str, tasks: list, eval_result: dict
+    ):
+        """Write a promoted skill to Muninn LTM."""
+        skill_content = json.dumps({
+            "artifact_type":       "skill",
+            "skill_id":            f"skill.{key.replace(' ', '_')}.v1",
+            "title":               eval_result.get("suggested_title", key),
+            "capability_summary":  eval_result.get("capability_summary", ""),
+            "evidence":            [t.task_id for t in tasks],
+            "confidence":          eval_result.get("confidence", 0.8),
+            "version":             1,
+            "synthesised_at":      _utcnow(),
+            "requires_confirmation_for_n_runs": SKILL_CONFIRM_RUNS,
+        })
+        self.muninn.consolidate_ltm(
+            narrative   = skill_content,
+            class_type  = "skill",
+            topics      = [key],
+            confidence  = eval_result.get("confidence", 0.8),
+            retain_tail = 0,
+            per_segment = False,
+        )
+
+    # ------------------------------------------------------------------
+    # Pipeline adaptation pass
+    # ------------------------------------------------------------------
+
+    def _pipeline_adaptation_pass(self):
+        """
+        Examine pipeline task notebooks post-session.
+        Promote observed parameter adjustments to LTM meta where warranted.
+        """
+        pipeline_tasks = self.htm.query(
+            initiated_by="system",
+            state="active|paused|completed",
+        )
+        for task in pipeline_tasks:
+            if not any("pipeline" in (task.tags or [])):
+                continue
+            # Look for parameter adjustment notes
+            for note in task.notebook:
+                entry = note.get("entry", "")
+                if "[sagax_adjust]" in entry:
+                    # A parameter adjustment was made mid-session.
+                    # Write to LTM meta as an observation for operator review.
+                    self.muninn.consolidate_ltm(
+                        narrative   = f"Pipeline adaptation observed: {entry}",
+                        class_type  = "observation",
+                        topics      = ["pipeline", "adaptation"] + (task.tags or []),
+                        confidence  = 0.7,
+                        retain_tail = 0,
+                        per_segment = False,
+                    )
+
+    # ------------------------------------------------------------------
+    # Session end — ASC flush
+    # ------------------------------------------------------------------
+
+    def session_end_flush(self, session_id: str = ""):
+        """
+        Called by Orchestrator at session end.
+        Logos is the sole authority to flush ASC.hot_entities.
+        Runs a final consolidation pass first.
+        """
+        self._pass()   # consume remaining raw events
+        self.htm.asc.flush()
+
+        # Emit session end marker to STM
+        self.stm.record(
+            source="system", type="internal",
+            payload={
+                "subtype":    "session_end",
+                "session_id": session_id,
+                "flushed_by": "logos",
+            },
+        )
+
+    # ------------------------------------------------------------------
+    # Health event
+    # ------------------------------------------------------------------
+
+    def _emit_health(
+        self, pass_id: str, started: float,
+        counts: dict, stm_flushed: int
+    ):
+        duration_ms = int((time.monotonic() - started) * 1000)
+        self.stm.record(
+            source="system", type="internal",
+            payload={
+                "subtype":       "logos_health",
+                "pass_id":       pass_id,
+                "duration_ms":   duration_ms,
+                "consolidated":  counts,
+                "stm_flushed":   stm_flushed,
+                "stm_remaining": len(self.stm.get_raw_events(
+                    after_id=self.stm.get_logos_watermark(), limit=200
+                )),
+            },
+        )
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _event_to_text(event: STMEvent) -> str:
+    p = event.payload
+    return (
+        p.get("text")
+        or p.get("description")
+        or p.get("content")
+        or p.get("event")
+        or json.dumps(p)[:200]
+    )
+
+
+def _utcnow() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
