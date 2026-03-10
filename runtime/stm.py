@@ -129,6 +129,57 @@ _WATERMARK_PREFIX = "__HUGINN_WATERMARK__:"
 CONS_N_MIN_NEW = 8
 CONS_N_MAX_NEW = 20
 
+# ---------------------------------------------------------------------------
+# Huginn-private SQLite helper
+# ---------------------------------------------------------------------------
+# Muninn's STMManager.record() takes a plain string — no is_compression kwarg.
+# We keep our sentinels (consN, watermark) in a separate Huginn metadata table
+# in the same DB, avoiding any collision with Muninn's STM storage format.
+
+def _ensure_huginn_tables(db_path: str):
+    """Create the huginn_meta table if it doesn't exist."""
+    import sqlite3
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS huginn_meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS huginn_events (
+                id         TEXT PRIMARY KEY,
+                ts         TEXT NOT NULL,
+                source     TEXT NOT NULL,
+                type       TEXT NOT NULL,
+                payload    TEXT NOT NULL,
+                confidence REAL NOT NULL DEFAULT 1.0
+            )
+        """)
+        conn.commit()
+
+
+def _meta_get(db_path: str, key: str) -> Optional[str]:
+    import sqlite3
+    try:
+        with sqlite3.connect(db_path) as conn:
+            row = conn.execute(
+                "SELECT value FROM huginn_meta WHERE key = ?", (key,)
+            ).fetchone()
+            return row[0] if row else None
+    except Exception:
+        return None
+
+
+def _meta_set(db_path: str, key: str, value: str):
+    import sqlite3
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO huginn_meta (key, value) VALUES (?, ?)",
+            (key, value)
+        )
+        conn.commit()
+
 
 class STMStore:
     """
@@ -152,19 +203,25 @@ class STMStore:
         self,
         muninn,
         summarise_fn: Optional[Callable] = None,
+        db_path: str = "",
     ):
         self._muninn   = muninn
         self._summarise = summarise_fn or _default_summarise
 
-        # In-memory caches — rebuilt from Muninn on first access
+        # Resolve db path: use muninn's db path if available, else separate file
+        self._db_path = (
+            db_path
+            or getattr(getattr(muninn, "db", None), "path", None)
+            or getattr(getattr(muninn, "db", None), "db_path", None)
+            or "huginn.db"
+        )
+        _ensure_huginn_tables(self._db_path)
+
+        # In-memory caches — rebuilt on first access
         self._events:    list[STMEvent] = []
         self._cons_n:    Optional[ConsN] = None
         self._watermark: str = ""
         self._loaded:    bool = False
-
-        # Muninn segment-id maps for sentinel deletion
-        self._cons_n_seg_id:    Optional[str] = None
-        self._watermark_seg_id: Optional[str] = None
 
     # ------------------------------------------------------------------
     # Lazy load
@@ -177,36 +234,35 @@ class STMStore:
         self._loaded = True
 
     def _load(self):
-        """Reconstruct in-memory state from all Muninn STM segments."""
-        # Muninn stores STMSegments; we read them via the STMManager
-        # (accessed through muninn.stm, which is a STMManager instance)
-        segments = self._muninn.stm.get_all_segments()
-        events   = []
+        """Reconstruct in-memory state from huginn_events and huginn_meta tables."""
+        import sqlite3
+        with sqlite3.connect(self._db_path) as conn:
+            rows = conn.execute(
+                "SELECT id, ts, source, type, payload, confidence "
+                "FROM huginn_events ORDER BY id"
+            ).fetchall()
 
-        for seg in segments:
-            c = seg.content
-            if c.startswith(_CONS_N_PREFIX):
-                try:
-                    self._cons_n = ConsN.from_json(c[len(_CONS_N_PREFIX):])
-                    self._cons_n_seg_id = seg.id
-                except Exception:
-                    pass
-            elif c.startswith(_WATERMARK_PREFIX):
-                self._watermark = c[len(_WATERMARK_PREFIX):]
-                self._watermark_seg_id = seg.id
-            else:
-                try:
-                    if not seg.is_compression:
-                        events.append(STMEvent.from_json(c))
-                except Exception:
-                    # Legacy plain-text segment — wrap it
-                    events.append(STMEvent.make(
-                        source="legacy", type="internal",
-                        payload={"text": c},
-                    ))
-
-        events.sort(key=lambda e: e.id)
+        events = []
+        for row in rows:
+            try:
+                events.append(STMEvent(
+                    id=row[0], ts=row[1], source=row[2], type=row[3],
+                    payload=json.loads(row[4]), confidence=row[5],
+                ))
+            except Exception:
+                pass
         self._events = events
+
+        # consN from meta
+        cons_n_raw = _meta_get(self._db_path, "cons_n")
+        if cons_n_raw:
+            try:
+                self._cons_n = ConsN.from_json(cons_n_raw)
+            except Exception:
+                self._cons_n = None
+
+        # watermark from meta
+        self._watermark = _meta_get(self._db_path, "logos_watermark") or ""
 
     # ------------------------------------------------------------------
     # Write API (called by Perception Manager only for percepts;
@@ -222,21 +278,33 @@ class STMStore:
     ) -> STMEvent:
         """
         Create and persist a new STM event.
+        Written to huginn_events table (not Muninn's STMManager).
         Returns the event with its assigned id.
         """
         self._ensure_loaded()
         event = STMEvent.make(source=source, type=type,
                               payload=payload, confidence=confidence)
-        self._muninn.stm.record(event.to_json())
+        self._write_event(event)
         self._events.append(event)
         return event
 
     def record_event(self, event: STMEvent) -> STMEvent:
         """Persist a pre-constructed STMEvent."""
         self._ensure_loaded()
-        self._muninn.stm.record(event.to_json())
+        self._write_event(event)
         self._events.append(event)
         return event
+
+    def _write_event(self, event: STMEvent):
+        import sqlite3
+        with sqlite3.connect(self._db_path) as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO huginn_events "
+                "(id, ts, source, type, payload, confidence) VALUES (?,?,?,?,?,?)",
+                (event.id, event.ts, event.source, event.type,
+                 json.dumps(event.payload), event.confidence)
+            )
+            conn.commit()
 
     # ------------------------------------------------------------------
     # Read API
@@ -297,6 +365,17 @@ class STMStore:
         # Leave 3-event safety margin at the head (still being written)
         safe = max(0, len(events) - 3)
         return events[:safe][:limit]
+
+    def get_events_after(self, last_id: str) -> list[STMEvent]:
+        """
+        All events with id > last_id, including the freshest ones.
+        Used by Exilis — no safety margin needed (it reads but never flushes).
+        """
+        self._ensure_loaded()
+        if not last_id:
+            return list(self._events)
+        anchor = self._index_of(last_id)
+        return self._events[anchor + 1:] if anchor >= 0 else list(self._events)
 
     def get_logos_watermark(self) -> str:
         """Return the id of the last event Logos has consolidated and flushed."""
@@ -384,7 +463,7 @@ class STMStore:
 
     def flush_up_to(self, event_id: str) -> int:
         """
-        Delete raw events with id <= event_id from Muninn.
+        Delete raw events with id <= event_id from huginn_events.
         Advances logos_watermark.
         Called by Logos after verified LTM writes.
         Returns the number of events flushed.
@@ -397,18 +476,14 @@ class STMStore:
         to_flush = self._events[:anchor + 1]
         keep     = self._events[anchor + 1:]
 
-        # Find and remove the Muninn STMSegments for these events
-        flush_ids = {e.id for e in to_flush}
-        segments  = self._muninn.stm.get_all_segments()
-        for seg in segments:
-            if seg.is_compression:
-                continue
-            try:
-                ev = STMEvent.from_json(seg.content)
-                if ev.id in flush_ids:
-                    self._muninn.stm.forget(seg.id)
-            except Exception:
-                pass
+        import sqlite3
+        flush_ids = [e.id for e in to_flush]
+        with sqlite3.connect(self._db_path) as conn:
+            conn.executemany(
+                "DELETE FROM huginn_events WHERE id = ?",
+                [(eid,) for eid in flush_ids]
+            )
+            conn.commit()
 
         self._events    = keep
         self._watermark = event_id
@@ -420,30 +495,12 @@ class STMStore:
     # ------------------------------------------------------------------
 
     def _persist_cons_n(self, cons_n: ConsN):
-        """Overwrite the consN sentinel in Muninn (delete old, write new)."""
-        if self._cons_n_seg_id:
-            try:
-                self._muninn.stm.forget(self._cons_n_seg_id)
-            except Exception:
-                pass
-        seg = self._muninn.stm.record(
-            _CONS_N_PREFIX + cons_n.to_json(),
-            is_compression=True,
-        )
-        self._cons_n_seg_id = getattr(seg, "id", None)
+        """Write consN to huginn_meta table."""
+        _meta_set(self._db_path, "cons_n", cons_n.to_json())
 
     def _persist_watermark(self):
-        """Overwrite the watermark sentinel in Muninn."""
-        if self._watermark_seg_id:
-            try:
-                self._muninn.stm.forget(self._watermark_seg_id)
-            except Exception:
-                pass
-        seg = self._muninn.stm.record(
-            _WATERMARK_PREFIX + self._watermark,
-            is_compression=True,
-        )
-        self._watermark_seg_id = getattr(seg, "id", None)
+        """Write logos_watermark to huginn_meta table."""
+        _meta_set(self._db_path, "logos_watermark", self._watermark)
 
     # ------------------------------------------------------------------
     # Internal helpers

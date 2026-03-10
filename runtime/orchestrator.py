@@ -167,6 +167,8 @@ class Orchestrator:
         self.exilis.on_urgent = self._on_exilis_urgent
         # Wire Sagax Narrator
         self.sagax.on_narrator_token = self.on_narrator_token
+        # Register internal tools that Sagax can call via <tool_call>
+        self._register_internal_tools()
         # Start all agents
         self.exilis.start()
         self.sagax.start()
@@ -176,6 +178,47 @@ class Orchestrator:
             target=self._scheduler_loop, daemon=True, name="SchedulerThread"
         )
         self._scheduler_thread.start()
+
+    def _register_internal_tools(self):
+        """
+        Register Orchestrator-internal tools that Sagax can call via
+        <tool_call> blocks. These never go through the permission gate
+        (they are system calls, not world-facing actuators).
+        """
+        from .tool_manager import ToolDescriptor
+
+        # request_early_logos_cycle — triggers an immediate Logos pass
+        # Used by Sagax when user says "urgent" during tool install confirmation
+        self.tool_manager.register(
+            tool_id    = "request_early_logos_cycle",
+            handler    = self._handle_early_logos_cycle,
+            descriptor = ToolDescriptor(
+                tool_id            = "request_early_logos_cycle",
+                title              = "Request early Logos maintenance cycle",
+                capability_summary = (
+                    "Ask Logos to run an immediate maintenance cycle, "
+                    "installing any affirmed staged tools without waiting "
+                    "for the normal interval. Use only when user says urgent."
+                ),
+                polarity           = "write",
+                permission_scope   = [],
+                inputs             = {},
+                outputs            = {"status": {"type": "string"}},
+                tier               = "world",
+            ),
+        )
+
+    def _handle_early_logos_cycle(self) -> dict:
+        """Handler for the request_early_logos_cycle internal tool."""
+        try:
+            self.logos.request_early_cycle()
+            return {"status": "ok", "message": "Early Logos cycle requested."}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    def request_early_logos_cycle(self):
+        """Public proxy — called directly if needed outside a tool_call context."""
+        self.logos.request_early_cycle()
 
     def stop(self):
         self._running = False
@@ -400,10 +443,15 @@ class Orchestrator:
                 self.perception.write_tool_result_event(
                     tool_id    = t["name"],
                     request_id = rid,
-                    result     = result if isinstance(result, dict) else {"output": result},
-                    success    = True,
+                    result     = result.output if hasattr(result, "output")
+                                 else (result if isinstance(result, dict) else {"output": result}),
+                    success    = result.success if hasattr(result, "success") else True,
+                    duration_ms = result.duration_ms if hasattr(result, "duration_ms") else 0,
                 )
-                self.htm.complete(tid, output={"result": result})
+                self.htm.complete(tid, output={
+                    "result":  result.output if hasattr(result, "output") else result,
+                    "success": result.success if hasattr(result, "success") else True,
+                })
 
             self._executor.submit(_dispatch)
 
@@ -422,8 +470,8 @@ class Orchestrator:
             t_ms    = tool.get("timeout_ms", self._aug_timeout_ms)
 
             # Reject any write-polarity tools in aug_call
-            descriptor = self._get_tool_descriptor(name)
-            if descriptor and descriptor.get("polarity", "read") != "read":
+            polarity = self.tool_manager.get_polarity(name)
+            if polarity != "read":
                 results[name] = {"status": "error",
                                  "reason": "aug_call_write_tool_rejected"}
                 continue
@@ -589,28 +637,7 @@ class Orchestrator:
 # ToolManager stub — replace with real implementation
 # ---------------------------------------------------------------------------
 
-class ToolManager:
-    """
-    Dispatches tool calls to registered Python handlers.
-    Tool descriptors are stored in Muninn LTM; this registry maps
-    tool_id → Python callable for runtime execution.
-    """
-
-    def __init__(self, muninn):
-        self.muninn   = muninn
-        self._handlers: dict[str, Callable] = {}
-
-    def register(self, tool_id: str, handler: Callable):
-        self._handlers[tool_id] = handler
-
-    def execute(self, tool_id: str, args: dict) -> Any:
-        handler = self._handlers.get(tool_id)
-        if handler is None:
-            return {"status": "error", "reason": f"tool_not_registered: {tool_id}"}
-        try:
-            return handler(**args)
-        except Exception as e:
-            return {"status": "error", "reason": str(e)}
+from .tool_manager import ToolManager
 
 
 # ---------------------------------------------------------------------------

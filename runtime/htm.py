@@ -304,7 +304,8 @@ class HTM:
         else:
             self._mem[task.task_id] = task
 
-    def _load(self, initiated_by=None, state=None, session_id=None, task_id=None):
+    def _load(self, initiated_by=None, state=None, session_id=None,
+              task_id=None, tags_any=None, tags_all=None):
         if self._conn:
             clauses, params = [], []
             if initiated_by: clauses.append("initiated_by=?"); params.append(initiated_by)
@@ -317,7 +318,7 @@ class HTM:
             rows  = self._conn.execute(
                 f"SELECT data FROM htm_tasks {where} ORDER BY created_at", params
             ).fetchall()
-            return [Task.from_json(r[0]) for r in rows]
+            result = [Task.from_json(r[0]) for r in rows]
         else:
             result = list(self._mem.values())
             if initiated_by: result = [t for t in result if t.initiated_by == initiated_by]
@@ -326,7 +327,14 @@ class HTM:
                 result = [t for t in result if t.state in states]
             if session_id: result = [t for t in result if t.session_id == session_id]
             if task_id:    result = [t for t in result if t.task_id == task_id]
-            return sorted(result, key=lambda t: t.created_at)
+            result = sorted(result, key=lambda t: t.created_at)
+
+        # tags_any / tags_all applied in Python (tags stored in JSON, not indexed)
+        if tags_any:
+            result = [t for t in result if any(tag in t.tags for tag in tags_any)]
+        if tags_all:
+            result = [t for t in result if all(tag in t.tags for tag in tags_all)]
+        return result
 
     # ------------------------------------------------------------------
     # Public task API
@@ -396,9 +404,18 @@ class HTM:
         state:        Optional[str] = None,
         session_id:   Optional[str] = None,
         task_id:      Optional[str] = None,
+        tags_any:     Optional[list] = None,
+        tags_all:     Optional[list] = None,
     ) -> list[Task]:
-        """state can be pipe-separated for OR: 'active|due'"""
-        return self._load(initiated_by, state, session_id, task_id)
+        """
+        Filter tasks by any combination of criteria.
+
+        state: pipe-separated OR  e.g. 'active|due|paused'
+        tags_any: task must have AT LEAST ONE of these tags
+        tags_all: task must have ALL of these tags
+        """
+        return self._load(initiated_by, state, session_id, task_id,
+                          tags_any=tags_any, tags_all=tags_all)
 
     def mark_consolidated(self, task_id: str) -> bool:
         return self.update(task_id, note="[logos] consolidated")
