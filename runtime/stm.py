@@ -404,7 +404,7 @@ class STMStore:
     def update_cons_n(
         self,
         force:       bool = False,
-        topic_hints: list[str] = None,
+        topic_hints: Optional[list[str]] = None,
     ) -> Optional[ConsN]:
         """
         Update the rolling narrative summary.

@@ -172,7 +172,7 @@ class ActiveSessionCache:
         self.hot_tools[tool_id]["last_used"]   = _utcnow()
         self.hot_tools[tool_id]["use_count"]  += 1
 
-    def add_recall(self, query: str, results: list, query_topics: list = None):
+    def add_recall(self, query: str, results: list, query_topics: Optional[list] = None):
         self.hot_recalls.append({
             "query":        query,
             "results":      results,
@@ -195,7 +195,7 @@ class ActiveSessionCache:
         self,
         new_consN_topics:   list[str],
         new_consN_entities: list[str],
-        active_task_tools:  list[str] = None,
+        active_task_tools:  Optional[list[str]] = None,
     ):
         """
         Garbage collect stale surfaces on consN session boundary.
@@ -345,7 +345,7 @@ class HTM:
         title:        str,
         initiated_by: str = "sagax",
         persistence:  str = "volatile",
-        tags:         list = None,
+        tags:         Optional[list] = None,
         session_id:   str = "",
         remind_at:    Optional[str] = None,
         expiry_at:    Optional[str] = None,
@@ -386,7 +386,7 @@ class HTM:
         self._save(t)
         return True
 
-    def complete(self, task_id: str, output: dict = None, confidence: float = 1.0,
+    def complete(self, task_id: str, output: Optional[dict] = None, confidence: float = 1.0,
                  note: str = "") -> bool:
         tasks = self._load(task_id=task_id)
         if not tasks: return False

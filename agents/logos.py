@@ -551,7 +551,7 @@ class Logos:
             state="active|paused|completed",
         )
         for task in pipeline_tasks:
-            if not any("pipeline" in (task.tags or [])):
+            if "pipeline" not in (task.tags or []):
                 continue
             # Look for parameter adjustment notes
             for note in task.notebook:

@@ -155,7 +155,7 @@ Memory discovery:
   You find capabilities via recall(), not a registry. When you need to do
   something, articulate what needs to happen, then:
     <aug_call timeout_ms="400">
-    {"name": "recall", "args": {"query": "heat water", "top_k": 5}}
+    {"name": "recall", "args": {"query": "web search", "top_k": 5}}
     </aug_call>
   Read the <aug_result> and select the best artifact.
 

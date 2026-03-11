@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 from .stm import STMStore, STMEvent
-from .htm import HTM
+from .htm import HTM, HotEntity
 from .perception import PerceptionManager, SessionContext
 
 
@@ -158,7 +158,7 @@ class Orchestrator:
     # Lifecycle
     # ------------------------------------------------------------------
 
-    def start(self, session: Session = None):
+    def start(self, session: Optional[Session] = None):
         if session:
             self.session = session
         self._running = True
@@ -231,8 +231,8 @@ class Orchestrator:
         self,
         entity_id:            str,
         permission_scope:     list[str],
-        denied:               list[str] = None,
-        confirmation_required: list[str] = None,
+        denied:               Optional[list[str]] = None,
+        confirmation_required: Optional[list[str]] = None,
     ) -> str:
         import uuid
         sid = f"sess-{uuid.uuid4().hex[:8]}"
@@ -596,16 +596,17 @@ class Orchestrator:
             entity_id = result["entity_id"]
             if entity_id not in self.htm.asc.hot_entities:
                 self.htm.asc.update_entity(
-                    type("HotEntity", (), {
-                        "entity_id": entity_id,
-                        "name": result.get("entity_name", ""),
-                        "status": "confirmed",
-                        "confidence": result.get("sig_match_confidence", 1.0),
-                        "voiceprint": None, "faceprint": None,
-                        "name_claims": [],
-                        "associations": {},
-                        "last_addressed": _utcnow(),
-                    })()
+                    HotEntity(
+                        entity_id=entity_id,
+                        name=result.get("entity_name", ""),
+                        status="confirmed",
+                        confidence=result.get("sig_match_confidence", 1.0),
+                        voiceprint=None,
+                        faceprint=None,
+                        name_claims=[],
+                        associations={},
+                        last_addressed=_utcnow(),
+                    )
                 )
         # If result has recall results, cache them
         if "recall_results" in result:

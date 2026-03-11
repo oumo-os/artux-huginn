@@ -264,7 +264,7 @@ class PerceptionManager:
         text:       str,
         entity_id:  str = "",
         confidence: float = 1.0,
-        extra:      dict = None,
+        extra:      Optional[dict] = None,
     ) -> STMEvent:
         """
         Write a transcribed speech event to STM.

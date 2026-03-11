@@ -96,7 +96,7 @@ class Sagax:
         llm:                LLMClient,
         orchestrator,
         entity_id:          str = "",
-        permission_scope:   list[str] = None,
+        permission_scope:   Optional[list[str]] = None,
         on_narrator_token:  Optional[Callable] = None,
     ):
         self.stm               = stm
@@ -130,7 +130,7 @@ class Sagax:
         if self._thread:
             self._thread.join(timeout=5.0)
 
-    def wake(self, signal: WakeSignal = None):
+    def wake(self, signal: Optional[WakeSignal] = None):
         """Queue a wake signal. Called by Orchestrator."""
         self._wake_queue.put(signal or WakeSignal())
 
@@ -341,10 +341,11 @@ class Sagax:
             permission_scope = ", ".join(self.permission_scope) or "none",
         )
 
-        self._messages.append({"role": "user", "content": user_prompt})
+        #self._messages.append({"role": "user", "content": user_prompt})
 
         resp = self.llm.complete(
             system   = SAGAX_PLAN_v1,
+            user     = user_prompt,
             messages = self._messages,
         )
         self._messages.append({"role": "assistant", "content": resp.text})
