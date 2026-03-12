@@ -80,13 +80,15 @@ class NarratorState:
     BUFFERING_AUG_CALL      = "BUFFERING_AUG_CALL"
     BUFFERING_TASK_UPDATE   = "BUFFERING_TASK_UPDATE"
     BUFFERING_PROJECTION    = "BUFFERING_PROJECTION"
+    STREAMING_SPEECH_STEP   = "STREAMING_SPEECH_STEP"   # speech_step: streaming + waiting for user
 
 
 # Block open/close patterns
-_BLOCK_OPEN  = re.compile(r"<(thinking|contemplation|speech|tool_call|aug_call|task_update|projection)(\s[^>]*)?>")
-_BLOCK_CLOSE = re.compile(r"</(thinking|contemplation|speech|tool_call|aug_call|task_update|projection)>")
+_BLOCK_OPEN  = re.compile(r"<(thinking|contemplation|speech|speech_step|tool_call|aug_call|task_update|projection)(\s[^>]*)?>")
+_BLOCK_CLOSE = re.compile(r"</(thinking|contemplation|speech|speech_step|tool_call|aug_call|task_update|projection)>")
 _TARGET_ATTR = re.compile(r'target="([^"]+)"')
 _TIMEOUT_ATTR = re.compile(r'timeout_ms="(\d+)"')
+_VAR_ATTR    = re.compile(r'var="([^"]+)"')
 
 
 # ---------------------------------------------------------------------------
@@ -143,10 +145,14 @@ class Orchestrator:
         self.session = Session()
 
         # Narrator state machine
-        self._narrator_state  = NarratorState.IDLE
-        self._block_buffer    = ""
-        self._speech_target   = ""
-        self._aug_timeout_ms  = self.DEFAULT_AUG_TIMEOUT_MS
+        self._narrator_state      = NarratorState.IDLE
+        self._block_buffer        = ""
+        self._speech_target       = ""
+        self._aug_timeout_ms      = self.DEFAULT_AUG_TIMEOUT_MS
+        # speech_step state
+        self._speech_step_var:    str            = ""
+        self._speech_step_event:  threading.Event = threading.Event()
+        self._speech_step_pending: bool           = False
 
         # Sagax wake queue fed by Exilis
         self._sagax_wake_pending = False
@@ -326,8 +332,9 @@ class Orchestrator:
             self._on_block_close(tag, content)
             return
 
-        # While streaming speech: forward tokens live to TTS
-        if self._narrator_state == NarratorState.STREAMING_SPEECH:
+        # While streaming speech or speech_step: forward tokens live to TTS
+        if self._narrator_state in (NarratorState.STREAMING_SPEECH,
+                                    NarratorState.STREAMING_SPEECH_STEP):
             if self.on_tts_token:
                 self.on_tts_token(token)
 
@@ -336,6 +343,7 @@ class Orchestrator:
             "thinking":       NarratorState.CAPTURING_THINKING,
             "contemplation":  NarratorState.CAPTURING_CONTEMPLATION,
             "speech":         NarratorState.STREAMING_SPEECH,
+            "speech_step":    NarratorState.STREAMING_SPEECH_STEP,
             "tool_call":      NarratorState.BUFFERING_TOOL_CALL,
             "aug_call":       NarratorState.BUFFERING_AUG_CALL,
             "task_update":    NarratorState.BUFFERING_TASK_UPDATE,
@@ -343,9 +351,13 @@ class Orchestrator:
         }
         self._narrator_state = state_map.get(tag, NarratorState.IDLE)
 
-        if tag == "speech":
+        if tag in ("speech", "speech_step"):
             m = _TARGET_ATTR.search(attrs)
             self._speech_target = m.group(1) if m else self.session.entity_id
+
+        if tag == "speech_step":
+            m = _VAR_ATTR.search(attrs)
+            self._speech_step_var = m.group(1) if m else "speech_step_result"
 
         if tag == "aug_call":
             m = _TIMEOUT_ATTR.search(attrs)
@@ -371,6 +383,9 @@ class Orchestrator:
                          "target": self._speech_target, "status": "complete"},
             )
             self.htm.asc.workbook_write("speech", content.strip())
+
+        elif tag == "speech_step":
+            self._handle_speech_step(content)
 
         elif tag == "tool_call":
             self._handle_tool_call(content)
@@ -561,6 +576,79 @@ class Orchestrator:
         self.htm.asc.workbook_write("projection", data)
 
     # ------------------------------------------------------------------
+    # <speech_step> — conversational skill suspension
+    # ------------------------------------------------------------------
+
+    def _handle_speech_step(self, content: str):
+        """
+        Handle a closed </speech_step> block.
+
+        The speech has already been streamed token-by-token to TTS
+        (STREAMING_SPEECH_STEP state).  Now:
+          1. Record the utterance in STM.
+          2. Mark a pending speech_step and clear the threading.Event.
+          3. Call sagax.pause_for_speech_step() — blocks Sagax generation
+             until receive_speech_step_response() is called with the reply.
+        """
+        var = self._speech_step_var or "speech_step_result"
+        self.stm.record(
+            source="system", type="output",
+            payload={
+                "subtype": "speech_step",
+                "text":    content.strip(),
+                "var":     var,
+                "target":  self._speech_target,
+                "status":  "awaiting_response",
+            },
+        )
+        self.htm.asc.workbook_write("speech_step", {
+            "text": content.strip(), "var": var,
+        })
+        self._speech_step_pending = True
+        self._speech_step_event.clear()
+        self.sagax.pause_for_speech_step(
+            var        = var,
+            step_event = self._speech_step_event,
+        )
+
+    def receive_speech_step_response(self, value: str):
+        """
+        Deliver the user's response to a pending speech_step.
+
+        Binds the value in Vigil.hot_parameters, injects
+        <speech_step_result> into Sagax's stream, and signals Sagax
+        to resume generation.
+        """
+        if not self._speech_step_pending:
+            return
+        var = self._speech_step_var or "speech_step_result"
+        self.htm.asc.bind_parameter(var, value)
+        self.stm.record(
+            source="user", type="speech_step_response",
+            payload={"var": var, "value": value},
+        )
+        self.sagax.inject_speech_step_result(var, value)
+        self._speech_step_pending = False
+        self._speech_step_var     = ""
+        self._speech_step_event.set()
+
+    def chat(self, user_input: str) -> None:
+        """
+        Public: deliver a user utterance to Artux.
+
+        Routes to receive_speech_step_response() if a speech_step is
+        pending; otherwise records in STM and wakes Sagax.
+        """
+        if self._speech_step_pending:
+            self.receive_speech_step_response(user_input)
+            return
+        self.stm.record(
+            source="user", type="audio",
+            payload={"text": user_input},
+        )
+        self.sagax.wake()
+
+    # ------------------------------------------------------------------
     # HTM scheduler tick
     # ------------------------------------------------------------------
 
@@ -635,7 +723,7 @@ class Orchestrator:
 
 
 # ---------------------------------------------------------------------------
-# ToolManager stub — replace with real implementation
+# ToolManager import (used by build_huginn factory)
 # ---------------------------------------------------------------------------
 
 from .tool_manager import ToolManager

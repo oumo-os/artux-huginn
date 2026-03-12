@@ -69,6 +69,7 @@ class ToolDescriptor:
     outputs:             dict[str, Any]
     required:            list[str] = field(default_factory=list)
     tier:                str = "world"           # "memory" | "world"
+    source_path:         str = ""               # absolute path to .py file (staged tools)
     handler:             Optional[Callable] = field(default=None, repr=False)
 
     def to_openai_schema(self) -> dict:
@@ -152,9 +153,18 @@ class ToolManager:
         self.muninn = muninn
         self.htm    = htm
 
-        # Muninn's ToolExecutor handles all memory-tier calls
-        from memory_module.tools import ToolExecutor
-        self._memory_executor = ToolExecutor(muninn)
+        # Muninn's ToolExecutor handles all memory-tier calls.
+        # Soft import: allows Huginn to run in test environments where
+        # the full Muninn package is not installed.
+        try:
+            from memory_module.tools import ToolExecutor
+            self._memory_executor = ToolExecutor(muninn)
+        except ImportError:
+            # Fallback stub for test environments / standalone use
+            class _StubExecutor:
+                def execute(self, tool_id, args):
+                    return {"status": "stub", "tool_id": tool_id}
+            self._memory_executor = _StubExecutor()
 
         # World tool registry: tool_id → ToolDescriptor (with handler)
         self._world: dict[str, ToolDescriptor] = {}
@@ -354,6 +364,7 @@ class ToolManager:
             inputs             = manifest.inputs,
             outputs            = manifest.outputs,
             tier               = "world",
+            source_path        = str(manifest.source_path),
             handler            = handler,
         )
         self._world[tool_id]        = descriptor

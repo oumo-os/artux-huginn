@@ -136,49 +136,63 @@ CONS_N_MAX_NEW = 20
 # We keep our sentinels (consN, watermark) in a separate Huginn metadata table
 # in the same DB, avoiding any collision with Muninn's STM storage format.
 
-def _ensure_huginn_tables(db_path: str):
-    """Create the huginn_meta table if it doesn't exist."""
+# Global registry for persistent :memory: connections.
+# sqlite3 :memory: databases are per-connection; every new connect() creates a
+# fresh empty database. We keep a persistent conn for each :memory: path key.
+_MEMORY_CONNS: dict = {}
+
+def _get_conn(db_path: str):
+    """Return a sqlite3 connection. For :memory:, reuse a persistent one."""
     import sqlite3
-    with sqlite3.connect(db_path) as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS huginn_meta (
-                key   TEXT PRIMARY KEY,
-                value TEXT NOT NULL
+    if db_path.startswith(":memory:"):
+        if db_path not in _MEMORY_CONNS:
+            _MEMORY_CONNS[db_path] = sqlite3.connect(
+                ":memory:", check_same_thread=False
             )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS huginn_events (
-                id         TEXT PRIMARY KEY,
-                ts         TEXT NOT NULL,
-                source     TEXT NOT NULL,
-                type       TEXT NOT NULL,
-                payload    TEXT NOT NULL,
-                confidence REAL NOT NULL DEFAULT 1.0
-            )
-        """)
-        conn.commit()
+        return _MEMORY_CONNS[db_path]
+    return sqlite3.connect(db_path, check_same_thread=False)
+
+
+def _ensure_huginn_tables(db_path: str):
+    """Create huginn_events and huginn_meta tables if they don't exist."""
+    conn = _get_conn(db_path)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS huginn_meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS huginn_events (
+            id         TEXT PRIMARY KEY,
+            ts         TEXT NOT NULL,
+            source     TEXT NOT NULL,
+            type       TEXT NOT NULL,
+            payload    TEXT NOT NULL,
+            confidence REAL NOT NULL DEFAULT 1.0
+        )
+    """)
+    conn.commit()
 
 
 def _meta_get(db_path: str, key: str) -> Optional[str]:
-    import sqlite3
     try:
-        with sqlite3.connect(db_path) as conn:
-            row = conn.execute(
-                "SELECT value FROM huginn_meta WHERE key = ?", (key,)
-            ).fetchone()
-            return row[0] if row else None
+        conn = _get_conn(db_path)
+        row  = conn.execute(
+            "SELECT value FROM huginn_meta WHERE key = ?", (key,)
+        ).fetchone()
+        return row[0] if row else None
     except Exception:
         return None
 
 
 def _meta_set(db_path: str, key: str, value: str):
-    import sqlite3
-    with sqlite3.connect(db_path) as conn:
-        conn.execute(
-            "INSERT OR REPLACE INTO huginn_meta (key, value) VALUES (?, ?)",
-            (key, value)
-        )
-        conn.commit()
+    conn = _get_conn(db_path)
+    conn.execute(
+        "INSERT OR REPLACE INTO huginn_meta (key, value) VALUES (?, ?)",
+        (key, value)
+    )
+    conn.commit()
 
 
 class STMStore:
@@ -236,11 +250,11 @@ class STMStore:
     def _load(self):
         """Reconstruct in-memory state from huginn_events and huginn_meta tables."""
         import sqlite3
-        with sqlite3.connect(self._db_path) as conn:
-            rows = conn.execute(
-                "SELECT id, ts, source, type, payload, confidence "
-                "FROM huginn_events ORDER BY id"
-            ).fetchall()
+        conn = _get_conn(self._db_path)
+        rows = conn.execute(
+            "SELECT id, ts, source, type, payload, confidence "
+            "FROM huginn_events ORDER BY id"
+        ).fetchall()
 
         events = []
         for row in rows:
@@ -296,15 +310,14 @@ class STMStore:
         return event
 
     def _write_event(self, event: STMEvent):
-        import sqlite3
-        with sqlite3.connect(self._db_path) as conn:
-            conn.execute(
-                "INSERT OR IGNORE INTO huginn_events "
-                "(id, ts, source, type, payload, confidence) VALUES (?,?,?,?,?,?)",
-                (event.id, event.ts, event.source, event.type,
-                 json.dumps(event.payload), event.confidence)
-            )
-            conn.commit()
+        conn = _get_conn(self._db_path)
+        conn.execute(
+            "INSERT OR IGNORE INTO huginn_events "
+            "(id, ts, source, type, payload, confidence) VALUES (?,?,?,?,?,?)",
+            (event.id, event.ts, event.source, event.type,
+             json.dumps(event.payload), event.confidence)
+        )
+        conn.commit()
 
     # ------------------------------------------------------------------
     # Read API
@@ -476,14 +489,13 @@ class STMStore:
         to_flush = self._events[:anchor + 1]
         keep     = self._events[anchor + 1:]
 
-        import sqlite3
         flush_ids = [e.id for e in to_flush]
-        with sqlite3.connect(self._db_path) as conn:
-            conn.executemany(
-                "DELETE FROM huginn_events WHERE id = ?",
-                [(eid,) for eid in flush_ids]
-            )
-            conn.commit()
+        conn = _get_conn(self._db_path)
+        conn.executemany(
+            "DELETE FROM huginn_events WHERE id = ?",
+            [(eid,) for eid in flush_ids]
+        )
+        conn.commit()
 
         self._events    = keep
         self._watermark = event_id

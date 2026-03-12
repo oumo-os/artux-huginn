@@ -399,9 +399,49 @@ Identity is established through signature matching — voiceprint, faceprint, or
 
 ---
 
+## Starter Tools
+
+Ten tools ship ready to install via the staging pipeline. Drop the files into
+`tools/staging/` and Huginn will discover and present them for confirmation.
+
+### Perception pipelines
+
+| File | Tool ID | What it does | Dependencies |
+|---|---|---|---|
+| `tool_voice_moonshine.py` | `tool.voice.moonshine.v1` | Microphone → Moonshine ONNX ASR. Offline, CPU-native, no PyTorch. Best for short commands. | `moonshine-onnx`, `sounddevice` |
+| `tool_voice_whisper.py` | `tool.voice.whisper.v1` | Microphone → faster-whisper ASR. Higher accuracy, multilingual, GPU-capable. | `faster-whisper`, `sounddevice` |
+| `tool_vision_smolvlm.py` | `tool.vision.smolvlm.v1` | Webcam → SmolVLM scene description. In-process, offline, saves frame to disk. | `transformers`, `torch`, `opencv-python`, `Pillow` |
+
+### Output
+
+| File | Tool ID | What it does | Dependencies |
+|---|---|---|---|
+| `tool_tts.py` | `tool.tts.v1` | Speak text aloud. Tries pyttsx3 → piper → espeak-ng in order. | `pyttsx3` (piper/espeak optional) |
+
+### Information lookups (safe for `<aug_call>`)
+
+| File | Tool ID | What it does | Dependencies |
+|---|---|---|---|
+| `tool_weather.py` | `tool.weather.v1` | Current weather + 3-day forecast via wttr.in. No API key. | `requests` |
+| `tool_web_search.py` | `tool.web.search.v1` | DuckDuckGo search — instant answers + organic results. No API key. | `requests` |
+| `tool_calendar_read.py` | `tool.calendar.read.v1` | Upcoming events from local `.ics` file or CalDAV URL. | `icalendar`, `requests` |
+| `tool_system_status.py` | `tool.system.status.v1` | CPU, memory, disk, uptime snapshot. | `psutil` |
+
+### Utility (write polarity)
+
+| File | Tool ID | What it does | Dependencies |
+|---|---|---|---|
+| `tool_timer.py` | `tool.timer.v1` | Set/cancel/list countdown timers. Fires an STM event on expiry → wakes Sagax. | _(stdlib only)_ |
+| `tool_notes.py` | `tool.notes.v1` | Append, read, list, search plain-text notes on disk. | _(stdlib only)_ |
+
+All tools follow the `HUGINN_MANIFEST` format and can be used as templates
+for custom tools. See [Adding a New Tool](#adding-a-new-tool) above.
+
+---
+
 ## Status
 
-Architecture stable. Implementation complete.
+Architecture stable. Core implementation complete. Starter tool set complete.
 
 - [x] Architecture spec (`design/CognitiveModule.md` v1.0)
 - [x] Orchestrator spec (`design/Orchestrator.md` v1.0)
@@ -418,7 +458,10 @@ Architecture stable. Implementation complete.
 - [x] `agents/sagax.py` — planning loop, Narrator stream, consN, staging confirmation dialogue
 - [x] `agents/logos.py` — consolidation daemon, skill synthesis, staging scan + tool install, early cycle
 - [x] `huginn/__init__.py` — `build_huginn()` factory with staging dirs wired
-- [ ] Test suite
+- [x] Starter tool set (10 tools in `tools/staging/`)
+- [ ] **Test suite** — smoke test `build_huginn()`, unit tests for STM/HTM/ToolDiscovery, integration test Huginn ↔ Muninn end-to-end
+- [ ] **Vigil layer** — reconceptualise HTM as a broader active-state layer with partitions: `hot_entities`, `hot_capabilities`, `hot_topics`, `hot_recalls`, `workbook`, `hot_parameters`, `tasks`
+- [ ] **`speech_step` skills** — conversational skill execution: emit utterance, await response, bind to variable, suspend/resume task
 - [ ] Async support (`aiosqlite` — push notification replaces Exilis poll loop)
 - [ ] Multi-agent STM write conflict handling (v0.5)
 
