@@ -180,6 +180,14 @@ class HuginnInstance:
 
     def start(self, session: "Session" = None):
         self.orchestrator.start(session=session)
+        # Execute the startup procedure after all components are running.
+        # Sagax recalls procedure.startup.v1 from LTM and emits boot tokens.
+        import threading
+        threading.Thread(
+            target=self.sagax.execute_startup_procedure,
+            daemon=True,
+            name="SagaxBoot",
+        ).start()
 
     def stop(self):
         self.orchestrator.stop()

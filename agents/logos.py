@@ -110,6 +110,7 @@ class Logos:
         self._running        = False
         self._thread:        Optional[threading.Thread] = None
         self._pass_id        = 0
+        self._first_pass     = True   # write startup procedure once
         self._early_cycle    = threading.Event()   # set by request_early_cycle()
 
     # ------------------------------------------------------------------
@@ -224,12 +225,14 @@ class Logos:
             )
 
             try:
-                self.tool_manager.install_tool(
+                descriptor = self.tool_manager.install_tool(
                     manifest          = manifest,
                     stm               = self.stm,
                     htm               = self.htm,
                     activate_pipeline = activate_pipeline,
                 )
+                # Wire any post-install callbacks (e.g. timer STM fire hook)
+                self._post_install_wire(manifest.tool_id, descriptor)
                 self.htm.complete(task_id, output={
                     "tool_id":   manifest.tool_id,
                     "installed": True,
@@ -254,12 +257,100 @@ class Logos:
 
         return installed
 
+    # ------------------------------------------------------------------
+    # Startup procedure
+    # ------------------------------------------------------------------
+
+    _STARTUP_PROCEDURE_KEY = "procedure.startup.v1"
+
+    _STARTUP_PROCEDURE_DEFAULT = {
+        "class_type":    "procedure",
+        "key":           "procedure.startup.v1",
+        "version":       1,
+        "description":   "Default boot sequence for Artux. Logos improves this over time.",
+        "steps": [
+            {
+                "id":          "recall_context",
+                "action":      "aug_call",
+                "description": "Recall recent session context and known entities from LTM",
+                "call":        {"name": "recall",
+                                "args": {"query": "recent context entities session",
+                                         "top_k": 5}},
+            },
+            {
+                "id":          "activate_pipelines",
+                "action":      "htm_query",
+                "description": "Ensure all perception pipeline tasks are active",
+                "tags":        ["pipeline", "perception"],
+            },
+            {
+                "id":          "announce",
+                "action":      "speech",
+                "description": "Announce readiness to the active entity",
+                "text":        "I'm here.",
+            },
+        ],
+    }
+
+    def _ensure_startup_procedure(self):
+        """
+        Write the default startup procedure to LTM if none exists.
+
+        On every first Logos pass (fresh DB or new instance), we check
+        whether procedure.startup.v1 is already in LTM. If not, we write
+        the default. Future Logos synthesis passes will improve it based
+        on observed execution traces.
+        """
+        try:
+            existing = self.muninn.recall(
+                self._STARTUP_PROCEDURE_KEY, top_k=1
+            )
+            if existing:
+                return   # already exists
+        except Exception:
+            pass   # recall not available yet — will retry next pass
+
+        try:
+            import json as _json
+            self.muninn.consolidate_ltm(
+                narrative  = (
+                    "Artux default startup procedure v1. "
+                    "Steps: recall recent context, activate perception pipelines, "
+                    "announce readiness."
+                ),
+                class_type = "procedure",
+                topics     = ["startup", "procedure", "boot"],
+                entities   = [],
+                confidence = 1.0,
+                meta       = {
+                    "key":  self._STARTUP_PROCEDURE_KEY,
+                    "body": _json.dumps(self._STARTUP_PROCEDURE_DEFAULT),
+                },
+            )
+            self.stm.record(
+                source="system", type="internal",
+                payload={
+                    "subtype": "startup_procedure_written",
+                    "key":     self._STARTUP_PROCEDURE_KEY,
+                },
+            )
+        except Exception as e:
+            # Non-fatal — next pass will retry
+            self.stm.record(
+                source="system", type="internal",
+                payload={
+                    "subtype": "startup_procedure_error",
+                    "error":   str(e),
+                },
+            )
+
     def _staged_wants_pipeline(self, task_id: str) -> bool:
         """Read HTM task notebook to see if the user requested pipeline activation."""
         try:
-            task = self.htm.get(task_id)
-            if task is None:
+            results = self.htm.query(task_id=task_id)
+            if not results:
                 return False
+            task = results[0]
             for note in reversed(task.notebook):
                 entry = note.get("entry", "")
                 if "enable_pipeline: true" in entry:
@@ -269,6 +360,67 @@ class Logos:
         except Exception:
             pass
         return False
+
+    def _post_install_wire(self, tool_id: str, descriptor) -> None:
+        """
+        Post-install wiring for tools that need runtime callbacks injected.
+        Called immediately after install_tool() returns the ToolDescriptor.
+
+        Currently wired tools:
+          tool.timer.v1 — register an STM fire callback so timer expiry
+                          writes a 'timer' event that wakes Exilis → Sagax.
+        """
+        if tool_id != "tool.timer.v1":
+            return
+
+        try:
+            # ToolManager._load_module stores the module in sys.modules under
+            # the huginn_tool_<normalised_id> key and also exposes it via the
+            # descriptor's handler __module__ attribute.
+            import sys
+            module_key = f"huginn_tool_{tool_id.replace('.', '_').replace('-', '_')}"
+            mod = sys.modules.get(module_key)
+
+            if mod is None and descriptor.source_path:
+                # Fallback: load directly from the installed source file
+                import importlib.util
+                spec = importlib.util.spec_from_file_location(
+                    module_key, descriptor.source_path)
+                if spec and spec.loader:
+                    mod = importlib.util.module_from_spec(spec)
+                    sys.modules[module_key] = mod
+                    spec.loader.exec_module(mod)
+
+            if mod is None:
+                return   # can't wire — non-fatal
+
+            stm = self.stm   # capture for closure
+
+            def _timer_fired(timer_id: str, label: str):
+                stm.record(
+                    source  = "system",
+                    type    = "timer",
+                    payload = {
+                        "timer_id": timer_id,
+                        "label":    label,
+                        "event":    "fired",
+                    },
+                )
+
+            if hasattr(mod, "register_fire_callback"):
+                mod.register_fire_callback(_timer_fired)
+
+        except Exception as e:
+            # Non-fatal — timer still works, it just won't wake Sagax on fire
+            self.stm.record(
+                source  = "system",
+                type    = "internal",
+                payload = {
+                    "subtype": "timer_wire_warning",
+                    "tool_id": tool_id,
+                    "error":   str(e),
+                },
+            )
 
     # ------------------------------------------------------------------
     # Main consolidation pass
@@ -283,6 +435,11 @@ class Logos:
             "skills": 0, "procedures": 0, "errors": 0, "skipped": 0,
             "tools_installed": 0,
         }
+
+        # On first ever pass: ensure the startup procedure exists in LTM
+        if self._first_pass:
+            self._first_pass = False
+            self._ensure_startup_procedure()
 
         # Always scan staging dir — even when no STM events to consolidate
         self._staging_scan_pass()

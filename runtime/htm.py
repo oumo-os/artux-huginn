@@ -87,46 +87,80 @@ class HotEntity:
 # ActiveSessionCache (ASC)
 # ---------------------------------------------------------------------------
 
+class Vigil(ActiveSessionCache if False else object):
+    pass  # forward-declare for type hints
+
+
 class ActiveSessionCache:
     """
-    Per-session ephemeral cache.
-    Sagax queries specific surfaces on demand via asc.get(surface).
-    Orchestrator writes to it; Logos flushes it at session end.
+    Vigil — the active present layer.
 
-    ASC GC policy (consN session boundary):
-      - hot_tools, hot_topics, hot_recalls, hot_state: prune stale entries
-      - hot_entities[unresolved/implied]: NEVER pruned
-      - hot_entities[confirmed]: prunable if not in new consN context
+    Per-session ephemeral operational state.  Sagax queries specific surfaces
+    on demand via asc.get(surface).  Orchestrator writes to it; Logos flushes
+    it at session end.
+
+    Surfaces
+    --------
+    workbook        — session reasoning log: all Narrator block outputs in order
+    hot_entities    — HotEntity records keyed by entity_id
+    hot_capabilities — recently used/discovered tools: {tool_id: descriptor snapshot}
+    hot_topics      — salient topics from consN context: {topic: {salience, ts}}
+    hot_recalls     — recent recall() results (capped at 20)
+    hot_parameters  — session-scoped variable bindings (speech_step results,
+                      skill input bindings): {var_name: value}
+    hot_state       — arbitrary session state for agent coordination
+
+    GC policy (consN session boundary)
+    -----------------------------------
+    hot_topics, hot_recalls         — prune if topic not in new consN
+    hot_capabilities                — prune if tool not in active tasks
+    hot_parameters                  — NEVER auto-pruned (cleared by skill completion)
+    hot_entities[confirmed]         — prune if entity not in new consN context
+    hot_entities[unresolved/implied]— NEVER pruned
     """
 
     def __init__(self, session_id: str = ""):
-        self.session_id     = session_id
-        self.workbook:      list[dict] = []
-        self.hot_entities:  dict[str, HotEntity] = {}
-        self.hot_tools:     dict[str, dict] = {}
-        self.hot_topics:    dict[str, dict] = {}
-        self.hot_recalls:   list[dict] = []
-        self.hot_state:     dict[str, Any] = {}
-        self._segment       = 0
-        self._archive:      list[dict] = []  # cold storage for Logos
+        self.session_id      = session_id
+        self.workbook:       list[dict]          = []
+        self.hot_entities:   dict[str, HotEntity]= {}
+        self.hot_capabilities: dict[str, dict]   = {}  # tool_id → descriptor snapshot
+        self.hot_topics:     dict[str, dict]     = {}
+        self.hot_recalls:    list[dict]          = []
+        self.hot_parameters: dict[str, Any]      = {}  # speech_step & skill vars
+        self.hot_state:      dict[str, Any]      = {}
+        self._segment        = 0
+        self._archive:       list[dict]          = []  # cold storage for Logos
 
-    # --- Sagax read ---
+    # ----------------------------------------------------------------
+    # Sagax read interface
+    # ----------------------------------------------------------------
 
     def get(self, surface: str) -> Any:
-        """Query a single ASC surface. Returns a snapshot copy."""
+        """
+        Query a single Vigil surface. Returns a snapshot copy.
+
+        Surfaces: workbook | hot_entities | hot_capabilities | hot_topics |
+                  hot_recalls | hot_parameters | hot_state
+        """
         surfaces = {
-            "workbook":     lambda: list(self.workbook),
-            "hot_entities": lambda: dict(self.hot_entities),
-            "hot_tools":    lambda: dict(self.hot_tools),
-            "hot_topics":   lambda: dict(self.hot_topics),
-            "hot_recalls":  lambda: list(self.hot_recalls),
-            "hot_state":    lambda: dict(self.hot_state),
+            "workbook":          lambda: list(self.workbook),
+            "hot_entities":      lambda: dict(self.hot_entities),
+            "hot_capabilities":  lambda: dict(self.hot_capabilities),
+            "hot_topics":        lambda: dict(self.hot_topics),
+            "hot_recalls":       lambda: list(self.hot_recalls),
+            "hot_parameters":    lambda: dict(self.hot_parameters),
+            "hot_state":         lambda: dict(self.hot_state),
         }
         if surface not in surfaces:
-            raise ValueError(f"Unknown ASC surface: {surface!r}")
+            raise ValueError(
+                f"Unknown Vigil surface: {surface!r}. "
+                f"Valid: {list(surfaces)}"
+            )
         return surfaces[surface]()
 
-    # --- Orchestrator writes ---
+    # ----------------------------------------------------------------
+    # Orchestrator write interface
+    # ----------------------------------------------------------------
 
     def workbook_write(self, block_type: str, content: Any, result: Any = None):
         self.workbook.append({
@@ -138,6 +172,7 @@ class ActiveSessionCache:
             "segment":    self._segment,
         })
 
+    # hot_entities
     def update_entity(self, entity: HotEntity):
         self.hot_entities[entity.entity_id] = entity
 
@@ -166,12 +201,34 @@ class ActiveSessionCache:
             entry.status    = "confirmed"
             self.hot_entities[entity_id] = entry
 
-    def update_tool_usage(self, tool_id: str):
-        if tool_id not in self.hot_tools:
-            self.hot_tools[tool_id] = {"tool_id": tool_id, "use_count": 0}
-        self.hot_tools[tool_id]["last_used"]   = _utcnow()
-        self.hot_tools[tool_id]["use_count"]  += 1
+    def touch_entity(self, entity_id: str):
+        if entity_id in self.hot_entities:
+            self.hot_entities[entity_id].last_addressed = _utcnow()
 
+    # hot_capabilities  (replaces the old thin hot_tools)
+    def update_capability(self, tool_id: str, descriptor_snapshot: dict):
+        """
+        Record or refresh a tool capability in the Vigil.
+
+        descriptor_snapshot should include at minimum:
+          tool_id, title, capability_summary, polarity, permission_scope, inputs
+        """
+        existing = self.hot_capabilities.get(tool_id, {})
+        self.hot_capabilities[tool_id] = {
+            **descriptor_snapshot,
+            "tool_id":   tool_id,
+            "last_used": _utcnow(),
+            "use_count": existing.get("use_count", 0) + 1,
+        }
+
+    # hot_topics
+    def add_topic(self, topic: str, salience: float = 1.0):
+        self.hot_topics[topic] = {
+            "salience": salience,
+            "ts":       _utcnow(),
+        }
+
+    # hot_recalls
     def add_recall(self, query: str, results: list, query_topics: list = None):
         self.hot_recalls.append({
             "query":        query,
@@ -182,14 +239,28 @@ class ActiveSessionCache:
         if len(self.hot_recalls) > 20:
             self.hot_recalls = self.hot_recalls[-20:]
 
-    def touch_entity(self, entity_id: str):
-        if entity_id in self.hot_entities:
-            self.hot_entities[entity_id].last_addressed = _utcnow()
+    # hot_parameters  (speech_step & skill variable bindings)
+    def bind_parameter(self, name: str, value: Any):
+        """Bind a named variable. Used by speech_step and skill steps."""
+        self.hot_parameters[name] = value
 
+    def get_parameter(self, name: str, default: Any = None) -> Any:
+        return self.hot_parameters.get(name, default)
+
+    def clear_parameter(self, name: str):
+        self.hot_parameters.pop(name, None)
+
+    # hot_state
     def set_state(self, key: str, value: Any):
         self.hot_state[key] = value
 
-    # --- Orchestrator GC (consN session boundary) ---
+    # Backward compat shim (old hot_tools callers)
+    def update_tool_usage(self, tool_id: str, descriptor_snapshot: dict = None):
+        self.update_capability(tool_id, descriptor_snapshot or {"tool_id": tool_id})
+
+    # ----------------------------------------------------------------
+    # GC (consN session boundary)
+    # ----------------------------------------------------------------
 
     def gc(
         self,
@@ -198,27 +269,41 @@ class ActiveSessionCache:
         active_task_tools:  list[str] = None,
     ):
         """
-        Garbage collect stale surfaces on consN session boundary.
-        hot_entities[unresolved/implied] are NEVER pruned.
-        Archives current workbook segment to cold storage.
+        Garbage collect stale Vigil surfaces on consN session boundary.
+
+        hot_parameters and hot_entities[unresolved/implied] are NEVER pruned.
+        Archives current workbook segment to cold storage for Logos.
         """
         active_task_tools = active_task_tools or []
         topic_set  = set(new_consN_topics)
         entity_set = set(new_consN_entities)
+        tool_set   = set(active_task_tools)
 
-        self.hot_topics  = {k: v for k, v in self.hot_topics.items() if k in topic_set}
-        self.hot_recalls = [r for r in self.hot_recalls
-                            if any(t in topic_set for t in r.get("query_topics", []))]
-        self.hot_tools   = {k: v for k, v in self.hot_tools.items()
-                            if k in active_task_tools}
+        # Prune stale topics
+        self.hot_topics = {
+            k: v for k, v in self.hot_topics.items() if k in topic_set
+        }
 
-        # Entities: never prune unresolved/implied
+        # Prune stale recalls (keep if any query_topic is still salient)
+        self.hot_recalls = [
+            r for r in self.hot_recalls
+            if any(t in topic_set for t in r.get("query_topics", []))
+        ]
+
+        # Prune stale capabilities (keep if tool is in an active task)
+        self.hot_capabilities = {
+            k: v for k, v in self.hot_capabilities.items() if k in tool_set
+        }
+
+        # hot_parameters: NEVER auto-pruned — cleared by skill completion
+
+        # Entities: never prune unresolved/implied; prune confirmed if not salient
         for eid in list(self.hot_entities):
             e = self.hot_entities[eid]
             if e.status == "confirmed" and eid not in entity_set:
                 del self.hot_entities[eid]
 
-        # Archive workbook segment
+        # Archive workbook segment to cold storage
         self._archive.append({
             "archive_id":  f"wb-{self.session_id}-seg{self._segment}",
             "session_id":  self.session_id,
@@ -232,16 +317,50 @@ class ActiveSessionCache:
     def get_archived_segments(self) -> list[dict]:
         return list(self._archive)
 
-    # --- Logos flush (session end) ---
+    # ----------------------------------------------------------------
+    # Logos flush (session end)
+    # ----------------------------------------------------------------
 
     def flush(self):
-        """Full ASC flush. _archive is retained until Logos marks tasks consolidated."""
-        self.workbook     = []
-        self.hot_entities = {}
-        self.hot_tools    = {}
-        self.hot_topics   = {}
-        self.hot_recalls  = []
-        self.hot_state    = {}
+        """
+        Full Vigil flush at session end.
+        _archive is retained until Logos marks tasks consolidated.
+        hot_parameters cleared here — they are session-scoped.
+        """
+        self.workbook        = []
+        self.hot_entities    = {}
+        self.hot_capabilities= {}
+        self.hot_topics      = {}
+        self.hot_recalls     = []
+        self.hot_parameters  = {}
+        self.hot_state       = {}
+
+    # ----------------------------------------------------------------
+    # Convenience: summary for Sagax context injection
+    # ----------------------------------------------------------------
+
+    def summary_for_sagax(self) -> dict:
+        """
+        Build a compact Vigil summary to prepend to Sagax's user prompt.
+        Only includes non-empty surfaces.
+        """
+        out = {}
+        if self.hot_entities:
+            out["entities"] = [
+                {"id": e.entity_id, "name": e.name, "status": e.status}
+                for e in self.hot_entities.values()
+            ]
+        if self.hot_capabilities:
+            out["capabilities"] = [
+                {"tool_id": k, "title": v.get("title", k),
+                 "use_count": v.get("use_count", 0)}
+                for k, v in self.hot_capabilities.items()
+            ]
+        if self.hot_topics:
+            out["topics"] = list(self.hot_topics.keys())
+        if self.hot_parameters:
+            out["parameters"] = dict(self.hot_parameters)
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -349,11 +468,12 @@ class HTM:
         session_id:   str = "",
         remind_at:    Optional[str] = None,
         expiry_at:    Optional[str] = None,
+        progress:     str = "",
     ) -> str:
         task = Task(
             task_id=_uid(), title=title, initiated_by=initiated_by,
             persistence=persistence, tags=tags or [], session_id=session_id,
-            remind_at=remind_at, expiry_at=expiry_at,
+            remind_at=remind_at, expiry_at=expiry_at, progress=progress,
         )
         self._save(task)
         return task.task_id

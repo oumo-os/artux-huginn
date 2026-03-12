@@ -112,6 +112,8 @@ class Sagax:
         self._running  = False
         self._thread:  Optional[threading.Thread] = None
         self._messages: list[dict] = []   # Sagax's own conversation history
+        self._speech_step_var:   str   = ""    # pending speech_step variable name
+        self._speech_step_event         = None  # threading.Event from Orchestrator
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -310,6 +312,137 @@ class Sagax:
                 "role": "assistant",
                 "content": result_text,
             })
+
+    # ------------------------------------------------------------------
+    # Boot: execute the startup procedure recalled from LTM
+    # ------------------------------------------------------------------
+
+    def execute_startup_procedure(self):
+        """
+        Execute the startup procedure recalled from LTM.
+
+        Called by HuginnInstance.start() after all components are running.
+        Sagax recalls procedure.startup.v1 from Muninn and emits Narrator
+        tokens to execute each step.
+
+        If no procedure exists yet (fresh install, first boot before Logos
+        has written it), we emit a minimal default boot sequence inline.
+        """
+        import json as _json
+
+        PROCEDURE_KEY = "procedure.startup.v1"
+
+        # Try to recall the procedure from LTM
+        procedure = None
+        try:
+            results = self.muninn.recall(PROCEDURE_KEY, top_k=1)
+            if results:
+                meta = getattr(results[0], "meta", {}) or {}
+                body = meta.get("body", "")
+                if body:
+                    procedure = _json.loads(body)
+        except Exception:
+            pass
+
+        if procedure is None:
+            # Logos hasn't written it yet (first-ever boot) — use inline default
+            procedure = {
+                "steps": [
+                    {"id": "announce", "action": "speech",
+                     "text": "I'm here."},
+                ]
+            }
+
+        # Record boot start in STM
+        self.stm.record(
+            source="system", type="internal",
+            payload={"subtype": "boot_start", "procedure": PROCEDURE_KEY},
+        )
+
+        # Execute each step
+        for step in procedure.get("steps", []):
+            action = step.get("action", "")
+            try:
+                if action == "speech":
+                    text = step.get("text", "")
+                    if text and self.on_narrator_token:
+                        entity = self.entity_id or "user"
+                        for ch in f'<speech target="{entity}">{text}</speech>':
+                            self.on_narrator_token(ch)
+
+                elif action == "aug_call":
+                    call = step.get("call", {})
+                    if call and self.on_narrator_token:
+                        payload = _json.dumps(call)
+                        for ch in f'<aug_call timeout_ms="600">{payload}</aug_call>':
+                            self.on_narrator_token(ch)
+
+                elif action == "htm_query":
+                    tags = step.get("tags", [])
+                    tasks = self.htm.query(tags_any=tags, state="active")
+                    self.stm.record(
+                        source="system", type="internal",
+                        payload={
+                            "subtype":    "boot_pipeline_check",
+                            "tags":       tags,
+                            "task_count": len(tasks),
+                        },
+                    )
+            except Exception as e:
+                self.stm.record(
+                    source="system", type="internal",
+                    payload={
+                        "subtype": "boot_step_error",
+                        "step_id": step.get("id", ""),
+                        "error":   str(e),
+                    },
+                )
+
+        self.stm.record(
+            source="system", type="internal",
+            payload={"subtype": "boot_complete", "procedure": PROCEDURE_KEY},
+        )
+
+    # ------------------------------------------------------------------
+    # speech_step: pause/resume Sagax generation for user response
+    # ------------------------------------------------------------------
+
+    def pause_for_speech_step(self, var: str, step_event: "threading.Event"):
+        """
+        Called by Orchestrator when a <speech_step> block closes.
+
+        Records the pending variable name and the event that will be set
+        when the user's response arrives.  Sagax's _cycle() / stream loop
+        must check _speech_step_event before continuing to yield tokens.
+        We use a simple threading.Event stored on self; the Orchestrator's
+        generation thread blocks on it via inject_speech_step_result().
+        """
+        import threading
+        self._speech_step_var   = var
+        self._speech_step_event = step_event   # the same Event the Orchestrator owns
+
+    def inject_speech_step_result(self, var: str, value: str):
+        """
+        Called by Orchestrator after receive_speech_step_response().
+
+        Appends a <speech_step_result> to the assistant message stream
+        so the LLM resumes with the user's answer bound to `var`.
+        The threading.Event has already been set by the Orchestrator before
+        this is called, so generation can continue.
+        """
+        result_text = (
+            f'<speech_step_result var="{var}">{value}</speech_step_result>'
+        )
+        if self._messages and self._messages[-1]["role"] == "assistant":
+            self._messages[-1]["content"] += result_text
+        else:
+            self._messages.append({
+                "role":    "assistant",
+                "content": result_text,
+            })
+        # Clear local state
+        self._speech_step_var   = ""
+        self._speech_step_event = None
 
     # ------------------------------------------------------------------
     # Direct chat (for tests and minimal setups without the full loop)
