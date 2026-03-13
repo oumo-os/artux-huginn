@@ -719,11 +719,9 @@ class TestBuildHuginn(unittest.TestCase):
         from huginn import HuginnInstance
         muninn = MockMuninn()
         h = _build_huginn_with_mock_llm(
-            muninn      = muninn,
-            llm_backend = "ollama",
-            fast_model  = "qwen2.5:0.5b",
-            sagax_model = "llama3.2",
-            logos_model = "llama3.2",
+            muninn           = muninn,
+            fallback_model   = "llama3.2",
+            fallback_backend = "ollama",
         )
         self.assertIsInstance(h, HuginnInstance)
 
