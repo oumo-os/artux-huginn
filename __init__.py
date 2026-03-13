@@ -38,14 +38,9 @@ __all__ = [
 
 def build_huginn(
     muninn,
-    llm_backend:      str   = "ollama",
-    fast_model:       str   = "qwen2.5:0.5b",
-    sagax_model:      str   = "llama3.2",
-    logos_model:      str   = "llama3.2",
-    ollama_host:      str   = "http://localhost:11434",
-    anthropic_key:    str   = "",
-    temperature:      float = 0.1,
-    timeout_s:        float = 60.0,
+    fallback_model:   str   = "llama3.2",
+    fallback_backend: str   = "ollama",
+    fallback_host:    str   = "http://localhost:11434",
     logos_interval_s: float = 300.0,
     on_tts_token:     callable = None,
     on_ui_projection: callable = None,
@@ -55,8 +50,24 @@ def build_huginn(
     """
     Factory: instantiate and wire all Huginn components.
 
+    LLM configuration (backend, model names, API keys, host) is recalled
+    from Muninn LTM at startup — stored as class_type="config" entries
+    with distinctive topic keys (e.g. "artux.config.llm.v1").
+
+    The fallback_* parameters are only used when no config exists in LTM
+    (first-ever boot, before Logos has written defaults). After the first
+    Logos pass, recalled config takes over.
+
     Parameters
     ----------
+    muninn : MemoryAgent
+        The Muninn memory backend. All config and knowledge lives here.
+    fallback_model : str
+        Model name used for all agents when no LTM config is found.
+    fallback_backend : str
+        "ollama" | "anthropic" — used when no LTM config is found.
+    fallback_host : str
+        Ollama host URL used when no LTM config is found.
     staging_dir : str
         Directory Logos watches for new tool .py files.
         Defaults to ./tools/staging relative to the DB file location.
@@ -81,14 +92,15 @@ def build_huginn(
     if not active_dir:
         active_dir = os.path.join(base, "tools", "active")
 
-    def _llm(model):
+    def _llm():
+        """Create an LLMClient using fallback values only.
+        Orchestrator.start() will reconfigure it from LTM immediately."""
         return LLMClient(
-            backend     = llm_backend,
-            model       = model,
-            host        = ollama_host,
-            api_key     = anthropic_key,
-            temperature = temperature,
-            timeout     = timeout_s,
+            backend     = fallback_backend,
+            model       = fallback_model,
+            host        = fallback_host,
+            temperature = 0.1,
+            timeout     = 60.0,
         )
 
     stm          = STMStore(muninn)
@@ -108,9 +120,12 @@ def build_huginn(
         sig_threshold    = 0.88,
     )
 
-    fast_llm  = _llm(fast_model)
-    sagax_llm = _llm(sagax_model)
-    logos_llm = _llm(logos_model)
+    # All three agents share the same fallback LLM config at boot.
+    # Orchestrator.start() recalls artux.config.llm.* from Muninn and
+    # calls reconfigure() on each client with the appropriate role config.
+    fast_llm  = _llm()
+    sagax_llm = _llm()
+    logos_llm = _llm()
 
     exilis = Exilis(
         stm             = stm,

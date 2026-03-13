@@ -260,7 +260,15 @@ class ToolManager:
                 )
 
         try:
-            result = descriptor.handler(**args)
+            # Inject _muninn if the handler declares it as a parameter.
+            # This lets tools like tool_config_write.py access LTM directly
+            # without coupling to Huginn internals.
+            import inspect
+            call_args = dict(args)
+            sig = inspect.signature(descriptor.handler)
+            if "_muninn" in sig.parameters:
+                call_args["_muninn"] = self.muninn
+            result = descriptor.handler(**call_args)
             output = result if isinstance(result, dict) else {"output": result}
             self._update_hot_tools(tool_id, descriptor)
             return ToolResult(

@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 from .stm import STMStore, STMEvent
-from .htm import HTM, HotEntity
+from .htm import HTM
 from .perception import PerceptionManager, SessionContext
 
 
@@ -164,10 +164,14 @@ class Orchestrator:
     # Lifecycle
     # ------------------------------------------------------------------
 
-    def start(self, session: Optional[Session] = None):
+    def start(self, session: Session = None):
         if session:
             self.session = session
         self._running = True
+        # Recall system config from Muninn LTM and apply to all LLM clients.
+        # This runs synchronously before any agent starts so every agent
+        # has correct backend/model/key config from its first cycle.
+        self._apply_system_config(self._recall_system_config())
         # Wire Exilis callbacks
         self.exilis.on_act    = self._on_exilis_act
         self.exilis.on_urgent = self._on_exilis_urgent
@@ -184,6 +188,78 @@ class Orchestrator:
             target=self._scheduler_loop, daemon=True, name="SchedulerThread"
         )
         self._scheduler_thread.start()
+
+    # ------------------------------------------------------------------
+    # System config — recall from Muninn LTM, apply to all LLM clients
+    # ------------------------------------------------------------------
+
+    # Topic keys stored in Muninn — distinctive enough for exact structured match
+    _CFG_TOPICS = {
+        "exilis":  "artux.config.llm.exilis.v1",
+        "sagax":   "artux.config.llm.sagax.v1",
+        "logos":   "artux.config.llm.logos.v1",
+    }
+
+    def _recall_system_config(self) -> dict:
+        """
+        Recall all artux.config.* LTM entries from Muninn.
+
+        Returns a dict keyed by role ("exilis", "sagax", "logos") mapping
+        to a parsed config dict.  Missing roles fall back to an empty dict
+        (the LLMClient stays at its fallback values from build_huginn).
+
+        Keys never surface in Sagax context — this path is Orchestrator-only.
+        """
+        import json
+        muninn = self.tool_manager.muninn
+        configs = {}
+        for role, topic in self._CFG_TOPICS.items():
+            try:
+                results = muninn.recall(topic, top_k=1)
+                if results:
+                    entry = results[0]
+                    # RecallResult wraps the LTMEntry — access .entry or directly
+                    raw = getattr(entry, "entry", entry)
+                    content = getattr(raw, "content", "")
+                    if content:
+                        configs[role] = json.loads(content)
+            except Exception:
+                pass   # non-fatal — fallback values remain
+        return configs
+
+    def _apply_system_config(self, configs: dict):
+        """
+        Apply recalled config dicts to each agent's LLMClient.
+
+        Each agent exposes a .llm attribute holding its LLMClient.
+        LLMClient.reconfigure() handles partial dicts safely.
+        """
+        role_agents = {
+            "exilis": getattr(self.exilis, "llm", None),
+            "sagax":  getattr(self.sagax,  "llm", None),
+            "logos":  getattr(self.logos,  "llm", None),
+        }
+        for role, client in role_agents.items():
+            cfg = configs.get(role, {})
+            if cfg and client is not None and hasattr(client, "reconfigure"):
+                try:
+                    client.reconfigure(
+                        backend     = cfg.get("backend", ""),
+                        model       = cfg.get("model", ""),
+                        host        = cfg.get("host", ""),
+                        api_key     = cfg.get("api_key", ""),
+                        temperature = cfg.get("temperature"),
+                        timeout     = cfg.get("timeout"),
+                    )
+                except Exception as e:
+                    self.stm.record(
+                        source="system", type="internal",
+                        payload={
+                            "subtype": "config_apply_error",
+                            "role":    role,
+                            "error":   str(e),
+                        },
+                    )
 
     def _register_internal_tools(self):
         """
@@ -237,8 +313,8 @@ class Orchestrator:
         self,
         entity_id:            str,
         permission_scope:     list[str],
-        denied:               Optional[list[str]] = None,
-        confirmation_required: Optional[list[str]] = None,
+        denied:               list[str] = None,
+        confirmation_required: list[str] = None,
     ) -> str:
         import uuid
         sid = f"sess-{uuid.uuid4().hex[:8]}"
@@ -684,17 +760,16 @@ class Orchestrator:
             entity_id = result["entity_id"]
             if entity_id not in self.htm.asc.hot_entities:
                 self.htm.asc.update_entity(
-                    HotEntity(
-                        entity_id=entity_id,
-                        name=result.get("entity_name", ""),
-                        status="confirmed",
-                        confidence=result.get("sig_match_confidence", 1.0),
-                        voiceprint=None,
-                        faceprint=None,
-                        name_claims=[],
-                        associations={},
-                        last_addressed=_utcnow(),
-                    )
+                    type("HotEntity", (), {
+                        "entity_id": entity_id,
+                        "name": result.get("entity_name", ""),
+                        "status": "confirmed",
+                        "confidence": result.get("sig_match_confidence", 1.0),
+                        "voiceprint": None, "faceprint": None,
+                        "name_claims": [],
+                        "associations": {},
+                        "last_addressed": _utcnow(),
+                    })()
                 )
         # If result has recall results, cache them
         if "recall_results" in result:
