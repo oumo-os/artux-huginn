@@ -137,6 +137,45 @@ class LLMClient:
         self._ant_client = _ant.Anthropic(api_key=key)
 
     # ------------------------------------------------------------------
+    # Runtime reconfiguration (called by Orchestrator after config recall)
+    # ------------------------------------------------------------------
+
+    def reconfigure(
+        self,
+        backend:     str   = "",
+        model:       str   = "",
+        host:        str   = "",
+        api_key:     str   = "",
+        temperature: float = None,
+        timeout:     float = None,
+    ):
+        """
+        Apply a config dict recalled from Muninn LTM.
+
+        Only non-empty / non-None values are applied.
+        Backend switch triggers a full re-initialisation of the underlying
+        client (openai.OpenAI or anthropic.Anthropic).
+        """
+        new_backend = backend.lower() if backend else self.backend
+
+        if temperature is not None:
+            self.temperature = temperature
+        if timeout is not None:
+            self.timeout = timeout
+        if model:
+            self.model = model
+
+        # Backend switch or host/key change — re-init the underlying client
+        if new_backend != self.backend or host or api_key:
+            self.backend = new_backend
+            if self.backend == "ollama":
+                self._init_ollama(host or "http://localhost:11434")
+            elif self.backend == "anthropic":
+                self._init_anthropic(api_key)
+            else:
+                raise ValueError(f"Unknown backend: {self.backend!r}")
+
+    # ------------------------------------------------------------------
     # complete() — plain text
     # ------------------------------------------------------------------
 

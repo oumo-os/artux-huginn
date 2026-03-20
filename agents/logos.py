@@ -344,6 +344,81 @@ class Logos:
                 },
             )
 
+    # ------------------------------------------------------------------
+    # System config defaults
+    # ------------------------------------------------------------------
+
+    # Parallel to _CFG_TOPICS in Orchestrator — same keys
+    _CONFIG_DEFAULTS = {
+        "artux.config.llm.exilis.v1": {
+            "backend":     "ollama",
+            "model":       "qwen2.5:0.5b",
+            "host":        "http://localhost:11434",
+            "temperature": 0.0,
+            "timeout":     30.0,
+            "description": "Fast triage model for Exilis attention gate.",
+        },
+        "artux.config.llm.sagax.v1": {
+            "backend":     "ollama",
+            "model":       "llama3.2",
+            "host":        "http://localhost:11434",
+            "temperature": 0.2,
+            "timeout":     60.0,
+            "description": "Primary reasoning model for Sagax planning loop.",
+        },
+        "artux.config.llm.logos.v1": {
+            "backend":     "ollama",
+            "model":       "llama3.2",
+            "host":        "http://localhost:11434",
+            "temperature": 0.0,
+            "timeout":     120.0,
+            "description": "Consolidation model for Logos LTM synthesis.",
+        },
+    }
+
+    def _ensure_system_config(self):
+        """
+        Write default LLM config entries to Muninn LTM on first pass.
+
+        Each config is stored as class_type="config" with a distinctive
+        topic key (e.g. "artux.config.llm.sagax.v1").  The Orchestrator
+        recalls these surgically at startup using the same topic string.
+
+        Content is JSON-encoded into the LTM content field.  Muninn is
+        not modified — this is pure write using the existing store_ltm API.
+
+        If a config entry already exists (Orchestrator or user wrote one),
+        it is left untouched.
+        """
+        import json
+        for topic, defaults in self._CONFIG_DEFAULTS.items():
+            try:
+                # Surgical recall: topic string is distinctive — hits structured
+                # match before embeddings.  top_k=1 returns exactly that entry.
+                existing = self.muninn.recall(topic, top_k=1)
+                if existing:
+                    continue   # already written — leave user config untouched
+            except Exception:
+                pass   # recall not ready yet — will retry next pass
+
+            try:
+                self.muninn.store_ltm(
+                    content    = json.dumps(defaults),
+                    class_type = "config",
+                    topics     = [topic, "artux.config", "system"],
+                    confidence = 1.0,
+                )
+                self.stm.record(
+                    source="system", type="internal",
+                    payload={"subtype": "config_written", "key": topic},
+                )
+            except Exception as e:
+                self.stm.record(
+                    source="system", type="internal",
+                    payload={"subtype": "config_write_error",
+                             "key": topic, "error": str(e)},
+                )
+
     def _staged_wants_pipeline(self, task_id: str) -> bool:
         """Read HTM task notebook to see if the user requested pipeline activation."""
         try:
@@ -436,10 +511,11 @@ class Logos:
             "tools_installed": 0,
         }
 
-        # On first ever pass: ensure the startup procedure exists in LTM
+        # On first ever pass: ensure startup procedure and system config exist in LTM
         if self._first_pass:
             self._first_pass = False
             self._ensure_startup_procedure()
+            self._ensure_system_config()
 
         # Always scan staging dir — even when no STM events to consolidate
         self._staging_scan_pass()
@@ -708,7 +784,7 @@ class Logos:
             state="active|paused|completed",
         )
         for task in pipeline_tasks:
-            if "pipeline" not in (task.tags or []):
+            if not any("pipeline" in (task.tags or [])):
                 continue
             # Look for parameter adjustment notes
             for note in task.notebook:
