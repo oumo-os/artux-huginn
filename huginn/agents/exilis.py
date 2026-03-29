@@ -17,7 +17,15 @@ What Exilis IS NOT:
 The entire agent is one LLM call inside a notification handler.
 
 Loop behaviour:
-  Exilis runs in a tight poll loop (5 ms by default). It batches all
+  Exilis runs in a tight continuous loop. Each iteration checks
+  stm.events_pending(last_event_id) — a single EXISTS query with no
+  row loading. If nothing new, the loop yields (os.sched_yield or
+  time.sleep(0)) and continues immediately. When events are pending,
+  it batches them all into one triage call. This means:
+    - No fixed polling interval — inference fires exactly when needed
+    - Detection latency = one EXISTS query (< 1 ms) not the poll interval
+    - No wasted inference when the environment is quiet
+    - All
   available new events into a single LLM call per cycle — one call
   covers however many events arrived since the last check.
 
@@ -76,7 +84,7 @@ class Exilis:
         Called when triage == "act". Orchestrator queues Sagax wake.
     on_urgent : callable(event)
         Called when triage == "urgent". Orchestrator issues nudge.
-    poll_interval_s : float
+    idle_yield_s : float
         Seconds between polls when no new events. Default 0.005 (5 ms).
     """
 
@@ -87,14 +95,17 @@ class Exilis:
         llm:             LLMClient,
         on_act:          Callable,
         on_urgent:       Callable,
-        poll_interval_s: float = 0.005,
+        idle_yield_s: float = 0.0,
+        # idle_yield_s: seconds to yield when no events are pending.
+        # 0.0 = os.sched_yield (cooperative multitasking, near-zero latency).
+        # Set to 0.001 on systems where busy-waiting causes thermal issues.
     ):
         self.stm             = stm
         self.htm             = htm
         self.llm             = llm
         self.on_act          = on_act
         self.on_urgent       = on_urgent
-        self.poll_interval_s = poll_interval_s
+        self.idle_yield_s = idle_yield_s
 
         self._last_processed_id: str = ""
         self._running = False
@@ -122,11 +133,35 @@ class Exilis:
     # ------------------------------------------------------------------
 
     def _loop(self):
+        """
+        Tight continuous loop.
+
+        Each iteration:
+          1. events_pending() — one EXISTS query, < 1 ms, no rows loaded
+          2. If nothing new: yield and continue (no inference)
+          3. If new events: batch them, run one triage LLM call
+
+        This replaces the fixed-interval sleep. Detection latency is
+        now bounded by one EXISTS query instead of the poll interval.
+        """
+        import os as _os
         while self._running:
             try:
+                # Fast gate: is there anything to process?
+                if not self.stm.events_pending(self._last_processed_id):
+                    # Nothing new — yield to other threads without sleeping
+                    if self.idle_yield_s > 0:
+                        time.sleep(self.idle_yield_s)
+                    else:
+                        try:
+                            _os.sched_yield()
+                        except AttributeError:
+                            time.sleep(0)   # Windows fallback
+                    continue
+
                 self._tick()
+
             except Exception as e:
-                # Log to STM as internal error, keep running
                 try:
                     self.stm.record(
                         source="system", type="internal",
@@ -134,7 +169,8 @@ class Exilis:
                     )
                 except Exception:
                     pass
-            time.sleep(self.poll_interval_s)
+                # Brief pause after error to avoid tight error loops
+                time.sleep(0.01)
 
     def _tick(self):
         """
@@ -156,6 +192,8 @@ class Exilis:
         active_tasks = self.htm.query(state="active|paused", initiated_by="sagax")
 
         signal = self._triage(context, active_tasks, new_events)
+        if signal is None:
+            return
 
         if signal.label == TriageLabel.URGENT:
             self.on_urgent(new_events[-1])

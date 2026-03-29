@@ -324,23 +324,53 @@ class PerceptionManager:
             payload["signature_resolved"] = False
             return payload
 
-        # Query Muninn for candidate entities
+        # Query Muninn for entities that carry a signature of this kind.
+        #
+        # Muninn treats signatures as entity associations — entities whose
+        # content JSON includes a "signatures" list are the candidates.
+        # We retrieve them via topic-targeted recall ("signature", kind)
+        # and then apply cosine similarity locally.
+        #
+        # Topic tagging convention: entities with voiceprints are stored
+        # with topics=["signature", "voiceprint"] by whichever code
+        # registered them (Sagax via create_entity, or operator at setup).
         matched_id  = None
         best_score  = 0.0
 
         try:
-            candidates = self.muninn.resolve_entity(
-                clues=f"entity with {kind}", top_k=10
-            )
-            for entity, score in candidates:
+            try:
+                from memory_module.recall import RecallQuery as _RQ
+                _q = _RQ(topics=["signature", kind], top_k=20)
+            except ImportError:
+                _q = f"signature {kind}"
+
+            candidates = self.muninn.recall(_q, top_k=20)
+            for result in candidates:
+                entity = getattr(result, "entry", result)
                 stored = self._get_stored_embedding(entity, kind)
                 if stored:
                     sim = _cosine_similarity(embedding, stored)
                     if sim > best_score:
                         best_score = sim
-                        matched_id = entity.id
+                        matched_id = getattr(entity, "id", None)
         except Exception:
             pass
+
+        # Fallback: text-clue entity resolution if recall found nothing
+        if not matched_id or best_score < self.sig_threshold:
+            try:
+                fallback = self.muninn.resolve_entity(
+                    clues=f"person with {kind}", top_k=10
+                )
+                for entity, score in fallback:
+                    stored = self._get_stored_embedding(entity, kind)
+                    if stored:
+                        sim = _cosine_similarity(embedding, stored)
+                        if sim > best_score:
+                            best_score = sim
+                            matched_id = entity.id
+            except Exception:
+                pass
 
         if matched_id and best_score >= self.sig_threshold:
             payload["entity_id"]            = matched_id

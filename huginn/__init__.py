@@ -39,6 +39,106 @@ __all__ = [
 ]
 
 
+
+def _assign_gguf_models(models_dir, htm) -> dict:
+    """
+    Scan the models directory and assign GGUF files to agent roles.
+
+    Each role benefits from a different model size:
+      exilis → tiny/small (0.5B–1.5B): single JSON triage call, temperature 0
+      sagax  → medium (3B–8B): full reasoning and Narrator stream
+      logos  → largest available (7B–13B+): deep consolidation and synthesis
+
+    Assignment priority (each role stops at first match):
+      1. HTM.states already set   — LTM recall or prior state_set wins
+      2. models/models.yaml       — explicit per-role filename config
+      3. Prefix-named .gguf files — exilis_*.gguf, sagax_*.gguf, logos_*.gguf
+      4. Size-ordered fallback    — smallest→exilis, middle→sagax, largest→logos
+      5. Single file              — shared across all roles (dev/test)
+
+    models.yaml example:
+      exilis: "qwen2.5-0.5b-instruct-q8_0.gguf"
+      sagax:  "llama-3.2-3b-instruct-q4_k_m.gguf"
+      logos:  "llama-3.1-8b-instruct-q4_k_m.gguf"
+    """
+    import pathlib as _pl
+    _models_dir = _pl.Path(models_dir)
+    PROVIDER = "tool.llm.llamacpp.v1"
+    assigned: dict = {}
+
+    def _already_set(role):
+        return bool(htm.states.get(f"{role}.provider"))
+
+    def _set_role(role, model_path):
+        if _already_set(role):
+            return
+        # Per-role model path key so llamacpp tool can select the right file
+        htm.states.set(f"tool.llm.llamacpp.v1.model_path.{role}", model_path, mark_dirty=False)
+        htm.states.set(f"{role}.provider", PROVIDER, mark_dirty=False)
+        assigned[role] = model_path
+
+    if not _models_dir.exists():
+        return {}
+
+    all_gguf = sorted(_models_dir.glob("*.gguf"))
+
+    # Priority 1: models.yaml
+    yaml_path = _models_dir / "models.yaml"
+    if yaml_path.exists():
+        data = {}
+        try:
+            import yaml as _y
+            data = _y.safe_load(yaml_path.read_text()) or {}
+        except ImportError:
+            for line in yaml_path.read_text().splitlines():
+                line = line.strip()
+                if line and not line.startswith("#") and ":" in line:
+                    k, _, v = line.partition(":")
+                    data[k.strip()] = v.strip().strip('"').strip("'")
+        for role in ("exilis", "sagax", "logos"):
+            fname = data.get(role, "")
+            if fname:
+                fp = _pl.Path(fname)
+                if not fp.is_absolute():
+                    fp = _models_dir / fname
+                if fp.exists():
+                    _set_role(role, str(fp))
+        if assigned:
+            return assigned
+
+    # Priority 2: prefix-named files
+    PREFIX_MAP = {
+        "exilis": "exilis", "small": "exilis", "fast": "exilis",
+        "sagax":  "sagax",  "medium": "sagax",
+        "logos":  "logos",  "large": "logos",
+    }
+    for f in all_gguf:
+        stem = f.stem.lower()
+        for pfx, role in PREFIX_MAP.items():
+            if stem.startswith(pfx + "_") or stem.startswith(pfx + "-"):
+                _set_role(role, str(f))
+                break
+    if assigned:
+        return assigned
+
+    # Priority 3: size-ordered fallback
+    if not all_gguf:
+        return {}
+
+    sized = sorted(all_gguf, key=lambda f: f.stat().st_size)
+    if len(sized) == 1:
+        for role in ("exilis", "sagax", "logos"):
+            _set_role(role, str(sized[0]))
+    elif len(sized) == 2:
+        _set_role("exilis", str(sized[0]))
+        _set_role("sagax",  str(sized[1]))
+        _set_role("logos",  str(sized[1]))
+    else:
+        for role, f in zip(("exilis", "sagax", "logos"), sized):
+            _set_role(role, str(f))
+
+    return assigned
+
 def build_huginn(
     muninn,
     fallback_model:   str   = "llama3.2",
@@ -82,6 +182,7 @@ def build_huginn(
     """
     from .runtime.tool_discovery import ToolDiscovery
     import os
+    import pathlib
 
     # Resolve staging/active dirs relative to DB path if not given
     db_path = (
@@ -97,6 +198,24 @@ def build_huginn(
 
     stm          = STMStore(muninn)
     htm          = HTM()
+
+    # ── GGUF model auto-detection ──────────────────────────────────────
+    # Each cognitive role needs a different model size for efficiency:
+    #   Exilis/consN → tiny/small (0.5B–1.5B): one JSON call, temperature 0
+    #   Sagax        → medium (3B–8B): full reasoning and Narrator stream
+    #   Logos        → largest available (7B–13B+): deep consolidation
+    #
+    # Assignment priority (each role stops at first match):
+    #   1. HTM.states already set (LTM recall or prior state_set)
+    #   2. models/models.yaml  — explicit per-role config
+    #   3. Prefix-named files  — exilis_*.gguf, sagax_*.gguf, logos_*.gguf
+    #   4. Single fallback     — any .gguf, shared across all unassigned roles
+    #   5. _BuiltinProvider    — Ollama/Anthropic from LTM config
+    _gguf_assigned = _assign_gguf_models(
+        pathlib.Path(db_path).parent / "models", htm
+    )
+    # ─────────────────────────────────────────────────────────────────
+
     pipeline_tools  = ToolRegistry()
     tool_manager    = ToolManager(muninn, htm)
     actuation_bus   = ActuationBus()
@@ -148,7 +267,7 @@ def build_huginn(
         llm             = fast_llm,
         on_act          = _noop,             # re-wired by Orchestrator.start()
         on_urgent       = _noop,
-        poll_interval_s = 0.005,
+        idle_yield_s    = 0.0,
     )
 
     sagax = Sagax(
@@ -197,6 +316,7 @@ def build_huginn(
         sagax             = sagax,
         logos             = logos,
         exilis            = exilis,
+        perception        = perception,
         stm               = stm,
         htm               = htm,
         tools             = pipeline_tools,

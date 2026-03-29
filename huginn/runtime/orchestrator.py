@@ -285,6 +285,42 @@ class Orchestrator:
                         },
                     )
 
+    def on_consn_updated(self, new_summary_text: str) -> None:
+        """
+        Called by Sagax immediately after a successful consN update.
+
+        This is the session boundary event. Triggers ASC GC — pruning
+        hot topics, recalls, and tools that no longer appear in the new
+        consN context. Unresolved implied entities are NEVER pruned.
+
+        Also archives the current workbook segment and opens a fresh one,
+        so each consN epoch has its own clean workbook for Logos.
+        """
+        try:
+            # Extract topics/entities from the new consN text for ASC GC
+            import re as _re
+            words = set(_re.findall(r'\b[A-Z][a-z]+\b', new_summary_text))
+            topics = [w.lower() for w in words]
+            entities = list(words)
+            self.htm.asc.gc(topics, entities)
+        except Exception:
+            pass   # GC failure is non-fatal
+
+        # Archive current workbook segment and open a new one
+        try:
+            self.htm.asc.workbook_write(
+                "session_boundary",
+                {"reason": "consn_update", "summary_length": len(new_summary_text)},
+            )
+        except Exception:
+            pass
+
+        self.stm.record(
+            source="system", type="internal",
+            payload={"subtype": "consn_updated",
+                     "summary_len": len(new_summary_text)},
+        )
+
     def _register_internal_tools(self):
         """
         Register Orchestrator-internal tools that Sagax can call via
@@ -446,14 +482,48 @@ class Orchestrator:
         """Two-stage nudge (Orchestrator.md §4)."""
         # Stage 1: immediate halt
         if self._narrator_state == NarratorState.STREAMING_SPEECH:
-            # Mark in-progress speech event as suspended
+            # Close the in-progress speech block as a full event with
+            # interrupted:true — consistent with "everything in STM is full".
+            # The partial content buffered so far is preserved in the record.
             self.stm.record(
                 source="system", type="output",
-                payload={"subtype": "speech", "status": "suspended",
-                         "reason": "urgent_interrupt"},
+                payload={
+                    "subtype":     "speech",
+                    "status":      "full",
+                    "interrupted": True,
+                    "partial_text": self._block_buffer.strip(),
+                    "target":      self._speech_target,
+                    "reason":      "urgent_interrupt",
+                },
             )
+            # Flush the speech buffer to ActuationBus as a terminal full event
+            self._publish_speech_full(self._block_buffer.strip(), self._speech_target)
+            self._block_buffer      = ""
+            self._chunk_buf         = ""
+            self._chunk_token_count = 0
             if self.on_tts_token:
                 self.on_tts_token("\x00")   # sentinel: halt TTS
+
+        elif self._narrator_state == NarratorState.STREAMING_SPEECH_STEP:
+            # speech_step interrupted before user responded — close as full+interrupted
+            self.stm.record(
+                source="system", type="output",
+                payload={
+                    "subtype":     "speech_step",
+                    "status":      "full",
+                    "interrupted": True,
+                    "partial_text": self._block_buffer.strip(),
+                    "var":         self._speech_step_var,
+                    "reason":      "urgent_interrupt",
+                },
+            )
+            self._block_buffer        = ""
+            self._chunk_buf           = ""
+            self._chunk_token_count   = 0
+            self._speech_step_pending = False
+            self._speech_step_event.set()   # unblock any waiting thread
+            if self.on_tts_token:
+                self.on_tts_token("\x00")
 
         elif self._narrator_state == NarratorState.BUFFERING_TOOL_CALL:
             self._block_buffer = ""

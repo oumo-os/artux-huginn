@@ -1916,6 +1916,582 @@ class TestInstructionSystem(unittest.TestCase):
 
 
 # ===========================================================================
+# TestExilisLoop — tight continuous loop with events_pending gate
+# ===========================================================================
+
+class TestExilisLoop(unittest.TestCase):
+
+    def test_events_pending_false_when_empty(self):
+        """events_pending returns False when no events exist after latest cursor."""
+        from huginn.runtime.stm import STMStore, _MEMORY_CONNS
+        import uuid
+        # Use a unique key so this test's :memory: DB is isolated
+        unique_key = f":memory:{uuid.uuid4().hex}"
+        stm = STMStore(None, db_path=unique_key)
+        self.assertFalse(stm.events_pending(""))
+
+    def test_events_pending_false_with_explicit_empty_store(self):
+        """events_pending is False on a brand-new store with no events."""
+        from huginn.runtime.stm import STMStore
+        import uuid
+        unique_key = f":memory:{uuid.uuid4().hex}"
+        stm = STMStore(None, db_path=unique_key)
+        self.assertFalse(stm.events_pending("any-id-that-doesnt-exist"))
+
+    def test_events_pending_true_after_write(self):
+        """events_pending returns True once an event is written."""
+        muninn = MockMuninn()
+        h      = _build_huginn_with_mock_llm(muninn=muninn)
+        ev = h.stm.record(source="test", type="speech",
+                          payload={"text": "hello"})
+        self.assertTrue(h.stm.events_pending(""))
+
+    def test_events_pending_false_after_cursor_advances(self):
+        """events_pending is False when cursor is already at latest event."""
+        muninn = MockMuninn()
+        h      = _build_huginn_with_mock_llm(muninn=muninn)
+        ev = h.stm.record(source="test", type="speech", payload={"text": "hi"})
+        # Advance cursor to this event
+        self.assertFalse(h.stm.events_pending(ev.id))
+
+    def test_events_pending_true_when_new_event_after_cursor(self):
+        """events_pending is True when new event exists after cursor."""
+        muninn = MockMuninn()
+        h      = _build_huginn_with_mock_llm(muninn=muninn)
+        ev1 = h.stm.record(source="test", type="speech", payload={"text": "first"})
+        ev2 = h.stm.record(source="test", type="speech", payload={"text": "second"})
+        # Cursor at ev1 — ev2 is still pending
+        self.assertTrue(h.stm.events_pending(ev1.id))
+        # Cursor at ev2 — nothing pending
+        self.assertFalse(h.stm.events_pending(ev2.id))
+
+    def test_exilis_idle_yield_replaces_poll_interval(self):
+        """Exilis accepts idle_yield_s, not poll_interval_s."""
+        from huginn.agents.exilis import Exilis
+        muninn = MockMuninn()
+        h      = _build_huginn_with_mock_llm(muninn=muninn)
+        # Should construct without error
+        ex = Exilis(
+            stm          = h.stm,
+            htm          = h.htm,
+            llm          = h.exilis.llm,
+            on_act       = lambda: None,
+            on_urgent    = lambda e: None,
+            idle_yield_s = 0.001,
+        )
+        self.assertEqual(ex.idle_yield_s, 0.001)
+
+    def test_exilis_tick_skips_when_no_pending_events(self):
+        """_tick returns immediately when there are no new events after cursor."""
+        muninn = MockMuninn()
+        h      = _build_huginn_with_mock_llm(muninn=muninn)
+        triage_calls = []
+        from huginn.agents.exilis import TriageSignal, TriageLabel
+        h.exilis._triage = lambda *a, **kw: (
+            triage_calls.append(True),
+            TriageSignal(label=TriageLabel.IGNORE, reason="test")
+        )[1]
+
+        # Advance cursor past any startup events so nothing is pending
+        all_events = h.stm.get_events_after("")
+        if all_events:
+            h.exilis._last_processed_id = all_events[-1].id
+
+        # Now _tick should return without calling _triage
+        h.exilis._tick()
+        self.assertEqual(len(triage_calls), 0)
+
+    def test_exilis_tick_runs_triage_when_pending(self):
+        """_tick calls _triage when events_pending is True."""
+        muninn = MockMuninn()
+        h      = _build_huginn_with_mock_llm(muninn=muninn)
+        triage_calls = []
+
+        from huginn.agents.exilis import TriageSignal, TriageLabel
+        h.exilis._triage = lambda *a, **kw: (
+            triage_calls.append(True),
+            TriageSignal(label=TriageLabel.IGNORE, reason="test")
+        )[1]
+
+        # Write an event, then tick
+        h.stm.record(source="test", type="speech", payload={"text": "hi"})
+        h.exilis._tick()
+        self.assertEqual(len(triage_calls), 1)
+
+
+# ===========================================================================
+# TestConsNGCWiring — consN update triggers ASC GC via Orchestrator
+# ===========================================================================
+
+class TestConsNGCWiring(unittest.TestCase):
+
+    def test_on_consn_updated_calls_asc_gc(self):
+        """on_consn_updated must call htm.asc.gc with extracted topics/entities."""
+        muninn = MockMuninn()
+        h      = _build_huginn_with_mock_llm(muninn=muninn)
+        orch   = h.orchestrator
+        orch.session.session_id = "test-sess"
+
+        h.htm.asc.hot_topics = ["lighting", "kitchen", "movies"]
+
+        gc_calls = []
+        orig_gc = h.htm.asc.gc
+        # gc now takes (topics_list, entities_list)
+        h.htm.asc.gc = lambda topics, entities=None, **kw: (
+            gc_calls.append((topics, entities)),
+            orig_gc(topics, entities or [])
+        )
+
+        orch.on_consn_updated("John asked about the weather.")
+        self.assertTrue(len(gc_calls) > 0,
+            "on_consn_updated should have called htm.asc.gc")
+        topics_arg = gc_calls[0][0]
+        self.assertIsInstance(topics_arg, list,
+            "gc should receive a list of topics, not a raw string")
+
+    def test_on_consn_updated_writes_stm_event(self):
+        """on_consn_updated records a consn_updated internal event to STM."""
+        muninn = MockMuninn()
+        h      = _build_huginn_with_mock_llm(muninn=muninn)
+        h.orchestrator.session.session_id = "test-sess"
+
+        before = len(h.stm.get_events_after(""))
+        h.orchestrator.on_consn_updated("some narrative")
+        after  = h.stm.get_events_after("")
+        events = [e for e in after if e.payload.get("subtype") == "consn_updated"]
+        self.assertTrue(len(events) > 0)
+
+    def test_sagax_update_cons_n_notifies_orchestrator(self):
+        """_update_cons_n must call orchestrator.on_consn_updated after success."""
+        muninn = MockMuninn()
+        h      = _build_huginn_with_mock_llm(muninn=muninn)
+
+        notified = []
+        h.orchestrator.on_consn_updated = lambda text: notified.append(text)
+        h.sagax._orchestrator = h.orchestrator
+
+        # Patch LLM to return a canned summary
+        class FakeResp:
+            text = "Canned consN summary."
+        h.sagax.llm.complete = lambda **kw: FakeResp()
+
+        # Patch stm.update_cons_n to return a fake ConsN
+        class FakeCons:
+            summary_text = "Canned consN summary."
+        h.sagax.stm.update_cons_n = lambda force=False: FakeCons()
+        h.sagax.stm.should_update_cons_n = lambda: True
+
+        h.sagax._update_cons_n()
+        self.assertTrue(len(notified) > 0,
+            "on_consn_updated was not called after _update_cons_n")
+
+    def test_asc_gc_prunes_stale_hot_topics(self):
+        """ASC GC should remove topics not referenced in new consN."""
+        muninn = MockMuninn()
+        h      = _build_huginn_with_mock_llm(muninn=muninn)
+
+        # hot_topics is a dict: {topic_str: metadata}
+        h.htm.asc.hot_topics = {
+            "lighting": {"source": "test"},
+            "kitchen":  {"source": "test"},
+            "movies":   {"source": "test"},
+            "weather":  {"source": "test"},
+        }
+        # GC with only "weather" in context
+        h.htm.asc.gc(["weather"], ["John"])
+        self.assertIn("weather", h.htm.asc.hot_topics)
+        self.assertNotIn("lighting", h.htm.asc.hot_topics)
+        self.assertNotIn("kitchen",  h.htm.asc.hot_topics)
+
+
+# ===========================================================================
+# TestInterruptedFlag — nudge writes full+interrupted, not suspended
+# ===========================================================================
+
+class TestInterruptedFlag(unittest.TestCase):
+
+    def test_nudge_during_speech_writes_full_interrupted(self):
+        """
+        When an urgent event fires during STREAMING_SPEECH, the STM event
+        must have status='full' and interrupted=True, not status='suspended'.
+        """
+        muninn = MockMuninn()
+        h      = _build_huginn_with_mock_llm(muninn=muninn)
+        orch   = h.orchestrator
+        orch.session.session_id = "test"
+
+        # Simulate mid-speech state
+        orch._narrator_state  = "STREAMING_SPEECH"
+        orch._block_buffer    = "Let me tell you about"
+        orch._speech_target   = "entity-john"
+
+        before = len(h.stm.get_events_after(""))
+
+        # Fire the nudge
+        from huginn.runtime.stm import STMEvent
+        fake_event = STMEvent(id="fake-stop", ts="2026-01-01T00:00:00Z",
+                              source="user", type="speech", payload={"text": "stop"})
+        orch._on_exilis_urgent(fake_event)
+
+        after  = h.stm.get_events_after("")
+        output = [e for e in after[before:]
+                  if e.type == "output"
+                  and e.payload.get("subtype") == "speech"]
+
+        self.assertTrue(len(output) > 0,
+            "No speech output event written during nudge")
+        ev = output[0]
+        self.assertEqual(ev.payload.get("status"), "full",
+            f"Expected status='full', got {ev.payload.get('status')!r}")
+        self.assertTrue(ev.payload.get("interrupted"),
+            "Expected interrupted=True in payload")
+
+    def test_nudge_not_during_speech_does_not_write_speech_event(self):
+        """When nudge fires while IDLE, no speech output event is written."""
+        muninn = MockMuninn()
+        h      = _build_huginn_with_mock_llm(muninn=muninn)
+        orch   = h.orchestrator
+        orch.session.session_id = "test"
+        orch._narrator_state  = "IDLE"
+
+        before = len(h.stm.get_events_after(""))
+        from huginn.runtime.stm import STMEvent
+        fake_event = STMEvent(id="fake-arr", ts="2026-01-01T00:00:00Z",
+                              source="sensor", type="sensor", payload={"event": "arrival"})
+        orch._on_exilis_urgent(fake_event)
+
+        after  = h.stm.get_events_after("")
+        speech = [e for e in after[before:]
+                  if e.type == "output"
+                  and e.payload.get("subtype") == "speech"]
+        self.assertEqual(len(speech), 0)
+
+    def test_no_suspended_status_in_stm(self):
+        """The word 'suspended' must not appear as a status in STM output events."""
+        muninn = MockMuninn()
+        h      = _build_huginn_with_mock_llm(muninn=muninn)
+        orch   = h.orchestrator
+        orch.session.session_id = "test"
+        orch._narrator_state  = "STREAMING_SPEECH"
+        orch._block_buffer    = "Hello world"
+        orch._speech_target   = "entity-john"
+
+        from huginn.runtime.stm import STMEvent
+        fake_event = STMEvent(id="fake-wait", ts="2026-01-01T00:00:00Z",
+                              source="user", type="speech", payload={"text": "wait"})
+        orch._on_exilis_urgent(fake_event)
+
+        all_events = h.stm.get_events_after("")
+        for ev in all_events:
+            self.assertNotEqual(
+                ev.payload.get("status"), "suspended",
+                f"Found deprecated 'suspended' status in STM event: {ev.payload}"
+            )
+
+    def test_speech_step_interrupt_clears_pending_flag(self):
+        """Interrupting during speech_step must clear the pending flag."""
+        muninn = MockMuninn()
+        h      = _build_huginn_with_mock_llm(muninn=muninn)
+        orch   = h.orchestrator
+        orch.session.session_id = "test"
+        orch._narrator_state      = "STREAMING_SPEECH_STEP"
+        orch._speech_step_pending = True
+        orch._speech_step_var     = "city"
+        orch._block_buffer        = "Which city?"
+
+        from huginn.runtime.stm import STMEvent
+        fake = STMEvent(id="fake-dep", ts="2026-01-01T00:00:00Z",
+                   source="sensor", type="sensor", payload={"event": "departure"})
+        orch._on_exilis_urgent(fake)
+
+        self.assertFalse(orch._speech_step_pending,
+            "speech_step_pending should be cleared after interrupt")
+
+
+# ===========================================================================
+# TestSkillSynthesisRefactor — observation-driven evaluation tasks
+# ===========================================================================
+
+class TestSkillSynthesisRefactor(unittest.TestCase):
+
+    def _make_completed_task(self, htm, title="turn on kitchen lights", days_ago=0):
+        """Helper: create a completed persist task with notebook entries."""
+        from datetime import datetime, timezone, timedelta
+        ts = (datetime.now(timezone.utc) - timedelta(days=days_ago)).isoformat()
+        tid = htm.create(
+            title       = title,
+            initiated_by= "sagax",
+            persistence = "persist",
+            tags        = ["lighting"],
+        )
+        htm.note(tid, f"Started task: {title}")
+        htm.note(tid, "Called tool.find_light.v1 — wrong light")
+        htm.note(tid, "Called tool.find_light.v2 — wrong light")
+        htm.note(tid, "Called tool.find_light.v3 — wrong light")
+        htm.note(tid, f"Called tool.set_kitchen_store_lights.v1 — success")
+        htm.complete(tid, output={"result": "lights_on", "confidence": 0.9},
+                     confidence=0.9)
+        return tid
+
+    def test_synthesis_scan_creates_evaluation_task(self):
+        """_skill_synthesis_scan should create HTM evaluation tasks for patterns."""
+        muninn = MockMuninn()
+        h      = _build_huginn_with_mock_llm(muninn=muninn)
+
+        # Create a few completed tasks with friction pattern
+        for i in range(3):
+            self._make_completed_task(h.htm, days_ago=i)
+
+        # Patch LLM to return a candidate with worth_tracking=True
+        h.logos.llm.complete_json = lambda **kw: {
+            "candidates": [{
+                "domain":           "kitchen_lighting",
+                "pattern":          "Multiple tool attempts to find correct light",
+                "friction":         "No direct kitchen light tool",
+                "opportunity":      "Synthesise skill with correct tool sequence",
+                "evidence_task_ids": [],
+                "worth_tracking":   True,
+            }]
+        }
+
+        before_tasks = h.htm.query(tags_any=["synthesis_candidate"])
+        h.logos._identify_synthesis_candidates([])
+        after_tasks  = h.htm.query(tags_any=["synthesis_candidate"])
+
+        self.assertGreater(len(after_tasks), len(before_tasks),
+            "No synthesis candidate evaluation task was created")
+
+    def test_synthesis_scan_does_not_directly_promote_skills(self):
+        """Skills must NOT be written to LTM directly — only via proposal tasks."""
+        muninn = MockMuninn()
+        h      = _build_huginn_with_mock_llm(muninn=muninn)
+
+        for i in range(3):
+            self._make_completed_task(h.htm, days_ago=i)
+
+        # Patch LLM: return a candidate with worth_tracking=True
+        h.logos.llm.complete_json = lambda **kw: {
+            "candidates": [{
+                "domain": "lighting", "pattern": "repeated", "friction": "slow",
+                "opportunity": "skill", "evidence_task_ids": [],
+                "worth_tracking": True,
+            }]
+        }
+
+        ltm_before = len(muninn.consolidated)
+        h.logos._identify_synthesis_candidates([])
+        ltm_after  = len(muninn.consolidated)
+
+        # No skill should have been written to LTM yet
+        new_ltm = muninn.consolidated[ltm_before:]
+        skill_writes = [c for c in new_ltm
+                        if c.get("class_type") == "skill"]
+        self.assertEqual(len(skill_writes), 0,
+            "Skills should not be written to LTM directly from identify pass")
+
+    def test_advance_creates_proposal_task_when_evidence_sufficient(self):
+        """_advance_evaluation_tasks creates a skill_proposal task on 'propose'."""
+        muninn = MockMuninn()
+        h      = _build_huginn_with_mock_llm(muninn=muninn)
+
+        # Create an evaluation task with enough evidence entries
+        tid = h.htm.create(
+            title       = "Skill synthesis candidate: kitchen_lighting",
+            initiated_by= "logos",
+            persistence = "persist",
+            tags        = ["synthesis_candidate",
+                           "synthesis_candidate.kitchen_lighting",
+                           "kitchen_lighting"],
+            progress    = "Pattern: multiple attempts to find light",
+        )
+        h.htm.note(tid, "[evidence] attempt 1: friction with 3 tools")
+        h.htm.note(tid, "[evidence] attempt 2: same friction pattern")
+
+        # Patch LLM to return 'propose'
+        h.logos.llm.complete_json = lambda **kw: {
+            "decision":           "propose",
+            "confidence":         0.85,
+            "skill_title":        "Switch Kitchen Store Lights",
+            "capability_summary": "Turns on kitchen store lights, prompts cabinet close.",
+            "guidance_steps":     ["Find store light", "Turn on", "Ask to close cabinets"],
+            "reason":             "Pattern seen twice with high friction",
+        }
+
+        before = h.htm.query(tags_any=["skill_proposal"])
+        h.logos._advance_evaluation_tasks()
+        after  = h.htm.query(tags_any=["skill_proposal"])
+
+        self.assertGreater(len(after), len(before),
+            "No skill_proposal task created after 'propose' verdict")
+
+    def test_advance_writes_proposed_skill_to_ltm(self):
+        """When verdict is 'propose', skill is written to LTM with status='proposed'."""
+        muninn = MockMuninn()
+        h      = _build_huginn_with_mock_llm(muninn=muninn)
+
+        tid = h.htm.create(
+            title       = "Skill synthesis candidate: kitchen_lighting",
+            initiated_by= "logos",
+            persistence = "persist",
+            tags        = ["synthesis_candidate",
+                           "synthesis_candidate.kitchen_lighting"],
+            progress    = "initial",
+        )
+        h.htm.note(tid, "[evidence] friction 1")
+        h.htm.note(tid, "[evidence] friction 2")
+
+        h.logos.llm.complete_json = lambda **kw: {
+            "decision":           "propose",
+            "confidence":         0.8,
+            "skill_title":        "Kitchen Store Lights Skill",
+            "capability_summary": "Controls kitchen store lights.",
+            "guidance_steps":     ["step 1", "step 2"],
+            "reason":             "two evidence entries",
+        }
+
+        ltm_before = len(muninn.consolidated)
+        h.logos._advance_evaluation_tasks()
+        ltm_after  = len(muninn.consolidated)
+
+        new_ltm = muninn.consolidated[ltm_before:]
+        skill_writes = [c for c in new_ltm
+                        if c.get("class_type") == "skill"]
+        self.assertGreater(len(skill_writes), 0,
+            "Proposed skill was not written to LTM")
+
+        import json
+        skill_data = json.loads(skill_writes[0].get("content", "{}"))
+        self.assertEqual(skill_data.get("status"), "proposed",
+            "Proposed skill should have status='proposed' until user confirms")
+
+    def test_advance_closes_task_on_insufficient_evidence(self):
+        """When verdict is 'insufficient', evaluation task is completed and closed."""
+        muninn = MockMuninn()
+        h      = _build_huginn_with_mock_llm(muninn=muninn)
+
+        tid = h.htm.create(
+            title       = "Skill synthesis candidate: bad_domain",
+            initiated_by= "logos",
+            persistence = "persist",
+            tags        = ["synthesis_candidate",
+                           "synthesis_candidate.bad_domain"],
+            progress    = "checking",
+        )
+        h.htm.note(tid, "[evidence] weak signal 1")
+        h.htm.note(tid, "[evidence] weak signal 2")
+
+        h.logos.llm.complete_json = lambda **kw: {
+            "decision":   "insufficient",
+            "confidence": 0.2,
+            "reason":     "Pattern not consistent across executions",
+        }
+
+        h.logos._advance_evaluation_tasks()
+        tasks = h.htm.query(task_id=tid)
+        self.assertEqual(tasks[0].state, "completed",
+            "Evaluation task should be completed when evidence is insufficient")
+
+
+# ===========================================================================
+# TestSignatureResolutionTopics — recall-based entity matching
+# ===========================================================================
+
+class TestSignatureResolutionTopics(unittest.TestCase):
+
+    def test_resolve_signature_calls_recall_with_topics(self):
+        """_resolve_signature should query recall with signature topics."""
+        muninn  = MockMuninn()
+        h       = _build_huginn_with_mock_llm(muninn=muninn)
+
+        recall_queries = []
+        orig_recall = muninn.recall
+        def patched_recall(q, top_k=5):
+            recall_queries.append(q)
+            return []   # no match — falls through to fallback
+        muninn.recall = patched_recall
+
+        payload = {
+            "text": "hello",
+            "signature": {
+                "kind":       "voiceprint",
+                "embedding":  [0.1, 0.2, 0.3],
+                "confidence": 0.9,
+            }
+        }
+        h.perception._resolve_signature(payload)
+
+        # At least one recall call should have been made
+        self.assertGreater(len(recall_queries), 0,
+            "_resolve_signature did not call muninn.recall")
+
+        # At least one query should target signature topics
+        q_strs = [str(q) for q in recall_queries]
+        sig_queries = [s for s in q_strs
+                       if "signature" in s or "voiceprint" in s]
+        self.assertGreater(len(sig_queries), 0,
+            "No recall query targeted signature/voiceprint topics")
+
+    def test_resolve_signature_enriches_payload_on_match(self):
+        """When cosine similarity exceeds threshold, entity_id is set."""
+        muninn = MockMuninn()
+        h      = _build_huginn_with_mock_llm(muninn=muninn)
+
+        # Fake entity with matching voiceprint in content
+        import json
+        class FakeEntityEntry:
+            id      = "entity-john-001"
+            content = json.dumps({
+                "signatures": [{
+                    "kind":      "voiceprint",
+                    "embedding": [0.9, 0.1, 0.0],
+                }]
+            })
+        class FakeResult:
+            entry = FakeEntityEntry()
+
+        muninn.recall = lambda q, top_k=5: [FakeResult()]
+
+        payload = {
+            "text": "hello",
+            "signature": {
+                "kind":      "voiceprint",
+                "embedding": [0.9, 0.1, 0.0],   # perfect match
+                "confidence": 0.95,
+            }
+        }
+        result = h.perception._resolve_signature(payload)
+
+        self.assertEqual(result.get("entity_id"), "entity-john-001",
+            "entity_id should be set on successful signature match")
+        self.assertTrue(result.get("signature_resolved"),
+            "signature_resolved should be True on match")
+
+    def test_resolve_signature_creates_implied_entity_on_no_match(self):
+        """When no entity matches, an implied entity is registered in ASC."""
+        muninn = MockMuninn()
+        h      = _build_huginn_with_mock_llm(muninn=muninn)
+
+        # No recall results
+        muninn.recall = lambda q, top_k=5: []
+
+        payload = {
+            "signature": {
+                "kind":       "voiceprint",
+                "embedding":  [0.1, 0.2, 0.3],
+                "confidence": 0.7,
+            }
+        }
+        result = h.perception._resolve_signature(payload)
+
+        self.assertFalse(result.get("signature_resolved"),
+            "signature_resolved should be False when no match found")
+        self.assertTrue(result.get("implied"),
+            "implied=True should be set for unresolved signatures")
+        self.assertIn("implied", result.get("entity_id", ""),
+            "entity_id should be an implied-* ID for unresolved signatures")
+
+
+# ===========================================================================
 # Main
 # ===========================================================================
 

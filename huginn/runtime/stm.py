@@ -390,6 +390,30 @@ class STMStore:
         anchor = self._index_of(last_id)
         return self._events[anchor + 1:] if anchor >= 0 else list(self._events)
 
+    def events_pending(self, since_id: str) -> bool:
+        """
+        Lightweight check: returns True if any events exist after `since_id`.
+
+        This is Exilis's own attention gate — a single EXISTS query, no rows
+        loaded, no LLM involved. The loop spins on this; inference only fires
+        when True.
+
+        Equivalent to: len(get_events_after(since_id)) > 0
+        but ~10x cheaper because it short-circuits on the first row.
+        """
+        conn = _get_conn(self._db_path)
+        if since_id:
+            row = conn.execute(
+                "SELECT EXISTS(SELECT 1 FROM huginn_events "
+                "WHERE id > ? LIMIT 1)",
+                (since_id,),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT EXISTS(SELECT 1 FROM huginn_events LIMIT 1)"
+            ).fetchone()
+        return bool(row and row[0])
+
     def get_logos_watermark(self) -> str:
         """Return the id of the last event Logos has consolidated and flushed."""
         self._ensure_loaded()

@@ -104,6 +104,7 @@ class Sagax:
         self.muninn            = muninn
         self.llm               = llm
         self.orchestrator      = orchestrator
+        self._orchestrator   = orchestrator    # internal alias for _update_cons_n
         self.entity_id         = entity_id
         self.permission_scope  = permission_scope or []
         self.on_narrator_token = on_narrator_token
@@ -260,8 +261,17 @@ class Sagax:
             # Temporarily override the summarise fn to return our result
             original_fn = self.stm._summarise
             self.stm._summarise = lambda _existing, _events: new_text
-            self.stm.update_cons_n(force=True)
+            new_cons = self.stm.update_cons_n(force=True)
             self.stm._summarise = original_fn
+
+            # Notify Orchestrator → triggers ASC GC (prunes stale hot context)
+            # This is the session boundary event: old topics/recalls/tools
+            # that don't appear in the new consN narrative are evicted.
+            if new_cons is not None and self._orchestrator is not None:
+                try:
+                    self._orchestrator.on_consn_updated(new_cons.summary_text)
+                except Exception:
+                    pass   # GC failure is non-fatal; context accumulates
 
         except Exception as e:
             # Non-fatal: consN update failed, will retry next cycle

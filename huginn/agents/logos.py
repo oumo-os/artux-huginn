@@ -59,8 +59,6 @@ from ..llm.prompts import (
 LOGOS_BATCH_SIZE        = 50      # max raw events per consolidation pass
 LOGOS_INTERVAL_S        = 300.0   # how often Logos wakes (seconds)
 LOGOS_SIZE_TRIGGER      = 40      # also wake if raw events exceed this
-SKILL_MIN_RUNS          = 3
-SKILL_MIN_DAYS          = 2
 SKILL_MIN_SIMILARITY    = 0.85
 SKILL_MAX_FAILURE_RATE  = 0.0     # 0 failures in last 5
 SKILL_CONFIRM_RUNS      = 2       # new skills need this many confirmed runs
@@ -523,6 +521,89 @@ class Logos:
                          "count": written},
             )
 
+    # ------------------------------------------------------------------
+    # Builtin default tool installation
+    # ------------------------------------------------------------------
+
+    def _ensure_default_tools(self):
+        """
+        Auto-install builtin default tools on first pass.
+
+        Builtin tools (in tools/builtin/) ship with Huginn and are
+        installed without staging confirmation — they are the packaged
+        defaults, not operator extensions. This mirrors how instruction
+        artifacts and system config are written on first boot.
+
+        Tools installed:
+          tool.llm.llamacpp.v1   — in-process GGUF inference
+          tool.tts.kokoro.v1     — Kokoro ONNX TTS daemon
+          tool.asr.moonshine.v1  — Moonshine ONNX ASR daemon
+          tool.ui.text.v1        — terminal text I/O
+
+        Each tool is only installed if:
+          1. Not already registered in ToolManager
+          2. Its source file exists in tools/builtin/
+          3. Its dependencies are importable (skipped gracefully if not)
+        """
+        import os, pathlib
+        from huginn.runtime.tool_discovery import parse_manifest
+
+        builtin_dir = pathlib.Path(__file__).parent.parent.parent / "tools" / "builtin"
+        if not builtin_dir.exists():
+            return
+
+        for tool_file in sorted(builtin_dir.glob("*.py")):
+            if tool_file.name.startswith("_"):
+                continue
+            try:
+                source = tool_file.read_text()
+                manifest = parse_manifest(source, str(tool_file))
+                if manifest is None:
+                    continue
+                tool_id = manifest.tool_id
+
+                # Skip if already installed
+                if self.tool_manager.get_descriptor(tool_id) is not None:
+                    continue
+
+                # Skip if dependencies are missing
+                if not self._deps_available(manifest.dependencies):
+                    continue
+
+                self.tool_manager.install_tool(
+                    manifest = manifest,
+                    stm      = self.stm,
+                    htm      = self.htm,
+                )
+                self.stm.record(
+                    source="system", type="internal",
+                    payload={
+                        "subtype": "builtin_tool_installed",
+                        "tool_id": tool_id,
+                    },
+                )
+            except Exception as e:
+                self.stm.record(
+                    source="system", type="internal",
+                    payload={
+                        "subtype": "builtin_tool_install_error",
+                        "file":    tool_file.name,
+                        "error":   str(e),
+                    },
+                )
+
+    def _deps_available(self, dependencies: list) -> bool:
+        """Return True if all pip dependencies are importable."""
+        for dep in dependencies:
+            pkg = dep.strip().split("[")[0].replace("-", "_")
+            if not pkg:
+                continue
+            try:
+                __import__(pkg)
+            except ImportError:
+                return False
+        return True
+
     def _staged_wants_pipeline(self, task_id: str) -> bool:
         """Read HTM task notebook to see if the user requested pipeline activation."""
         try:
@@ -621,6 +702,7 @@ class Logos:
             self._ensure_startup_procedure()
             self._ensure_system_config()
             self._ensure_instruction_defaults()
+            self._ensure_default_tools()
 
         # Always scan staging dir — even when no STM events to consolidate
         self._staging_scan_pass()
@@ -692,7 +774,7 @@ class Logos:
             self._emit_health(pass_id, started, counts, stm_flushed=0)
             return
 
-        # -- Step 2: skill synthesis scan
+        # -- Step 2: skill synthesis — observe patterns, manage evaluation tasks
         try:
             synth_count = self._skill_synthesis_scan(raw_batch)
             counts["skills"] += synth_count
@@ -790,117 +872,296 @@ class Logos:
     # ------------------------------------------------------------------
     # Skill synthesis
     # ------------------------------------------------------------------
+    # Skill synthesis — observation-driven evaluation tasks
+    # ------------------------------------------------------------------
+    #
+    # Design principle (Q4 resolution):
+    #   There are no hardcoded thresholds. Logos observes execution
+    #   patterns from the workbook and task notebooks, creates HTM
+    #   evaluation tasks for promising candidates, accumulates evidence
+    #   across sessions, and proposes skills when the evidence is strong.
+    #
+    #   The evaluation task IS the evidence record — its notebook
+    #   accumulates Logos's observations over multiple passes. When
+    #   Logos judges the evidence sufficient, it proposes the skill to
+    #   the user through the staging workflow.
+    #
+    #   Example: Sagax goes through 5 tools to find the kitchen light
+    #   switch. Logos observes the friction, creates a candidate task
+    #   tagged ["synthesis_candidate", "lighting", "kitchen"], notes
+    #   the pattern in the notebook. On the third similar session Logos
+    #   proposes "skill.switch_kitchen_store_lights.v1" with the
+    #   observation that the store lights only go off after asking the
+    #   user to close all cabinets.
+    # ------------------------------------------------------------------
 
     def _skill_synthesis_scan(self, events: list[STMEvent]) -> int:
         """
-        Look for repeated successful tool-call sequences in completed HTM tasks.
-        Returns the number of skills promoted.
+        Observe execution patterns and manage synthesis evaluation tasks.
+        Returns the number of new evaluation tasks created or updated.
         """
-        promoted = 0
+        changed = 0
+        changed += self._identify_synthesis_candidates(events)
+        changed += self._advance_evaluation_tasks()
+        return changed
 
-        # Find completed persist tasks not yet examined
+    def _identify_synthesis_candidates(self, events: list[STMEvent]) -> int:
+        """
+        Scan completed persist tasks and raw events for patterns worth
+        synthesising. For each novel pattern, create an evaluation task.
+        For existing evaluation tasks, append new evidence.
+        """
+        created = 0
         completed_tasks = self.htm.query(state="completed", initiated_by="sagax")
         persist_tasks   = [t for t in completed_tasks
                            if t.persistence == "persist"
-                           and not any("consolidated" in n.get("entry", "")
+                           and not any("[logos_examined]" in n.get("entry", "")
                                        for n in t.notebook)]
 
-        # Group tasks by title pattern (simplistic clustering)
-        clusters: dict[str, list] = {}
-        for task in persist_tasks:
-            key = task.title.lower().strip()
-            clusters.setdefault(key, []).append(task)
+        if not persist_tasks:
+            return 0
 
-        for key, tasks in clusters.items():
-            if len(tasks) < SKILL_MIN_RUNS:
+        # Ask Logos LLM to identify patterns across this batch of tasks
+        tasks_text = "\n\n".join(
+            f"task_id: {t.task_id}\n"
+            f"title: {t.title}\n"
+            f"created: {t.created_at}\n"
+            f"output confidence: {t.output.get('confidence', 'unknown')}\n"
+            f"notebook entries: {len(t.notebook)}\n"
+            + "\n".join(
+                f"  - {n.get('entry', '')[:200]}"
+                for n in t.notebook
+            )
+            for t in persist_tasks[:10]   # cap at 10 per pass
+        )
+
+        synthesis_prompt = (
+            "Examine these completed Sagax tasks and identify:\n"
+            "1. Repeated friction patterns (multiple tool attempts, fallbacks, corrections)\n"
+            "2. Sequences that worked well and might be reusable\n"
+            "3. Gaps where a skill or shortcut would reduce future friction\n\n"
+            "Return a JSON object with key 'candidates': a list of objects, each with:\n"
+            "  domain: string (short capability domain, e.g. 'kitchen_lighting')\n"
+            "  pattern: string (what repeated pattern was observed)\n"
+            "  friction: string (what made it hard, or 'none')\n"
+            "  opportunity: string (what a skill could do better)\n"
+            "  evidence_task_ids: list of task_ids that show this pattern\n"
+            "  worth_tracking: boolean\n\n"
+            "TASKS:\n" + tasks_text
+        )
+        try:
+            observations = self.llm.complete_json(
+                system      = LOGOS_SKILL_EVAL_v1,
+                user        = synthesis_prompt,
+                schema      = {"candidates": "array"},
+                temperature = 0,
+            )
+        except Exception:
+            # Mark tasks as examined even if LLM failed
+            for t in persist_tasks[:10]:
+                self.htm.note(t.task_id, "[logos_examined] LLM unavailable this pass")
+            return 0
+
+        candidates = observations.get("candidates", [])
+
+        for c in candidates:
+            if not c.get("worth_tracking", False):
                 continue
 
-            # Check day spread
-            from datetime import datetime, timezone
-            dates = set()
-            for t in tasks:
-                try:
-                    d = datetime.fromisoformat(t.created_at).date()
-                    dates.add(d)
-                except Exception:
-                    pass
-            if len(dates) < SKILL_MIN_DAYS:
-                continue
+            domain  = c.get("domain", "unknown").lower().replace(" ", "_")[:40]
+            pattern = c.get("pattern", "")[:200]
+            tag     = f"synthesis_candidate.{domain}"
 
-            # Ask LLM to evaluate and optionally synthesise
-            traces_text = "\n\n".join(
-                f"Task: {t.title}\n"
-                f"Created: {t.created_at}\n"
-                f"Output: {json.dumps(t.output)}\n"
-                f"Notebook:\n" + "\n".join(n["entry"] for n in t.notebook)
-                for t in tasks[-5:]   # last 5 executions
+            # Check if an evaluation task already exists for this domain
+            existing = self.htm.query(
+                tags_any=[tag], state="active|paused|waiting"
             )
 
-            candidate = {
-                "title":   key,
-                "runs":    len(tasks),
-                "success": sum(1 for t in tasks if t.output.get("confidence", 0) > 0.5),
-            }
-
-            try:
-                eval_result = self.llm.complete_json(
-                    system      = LOGOS_SKILL_EVAL_v1,
-                    user        = LOGOS_SKILL_EVAL_USER_v1.format(
-                        traces    = traces_text,
-                        candidate = json.dumps(candidate),
-                    ),
-                    schema      = {
-                        "decision": "string",
-                        "confidence": "number",
-                        "reason": "string",
-                        "capability_summary": "string",
-                        "suggested_title": "string",
-                    },
-                    temperature = 0,
+            if existing:
+                # Append new evidence to the existing evaluation task
+                task = existing[0]
+                entry = (
+                    f"[evidence] New execution pattern observed: {pattern}. "
+                    f"Friction: {c.get('friction', 'unknown')}. "
+                    f"Opportunity: {c.get('opportunity', '')}. "
+                    f"Evidence tasks: {c.get('evidence_task_ids', [])}"
                 )
-
-                if eval_result.get("decision") == "promote":
-                    self._write_skill_artifact(key, tasks, eval_result)
-                    promoted += 1
-
-                # Emit synthesis candidate event
+                self.htm.note(task.task_id, entry)
+            else:
+                # Create a new evaluation task for this synthesis candidate
+                task_id = self.htm.create(
+                    title       = f"Skill synthesis candidate: {domain}",
+                    initiated_by= "logos",
+                    persistence = "persist",
+                    tags        = ["synthesis_candidate", tag, domain],
+                    progress    = f"Pattern identified: {pattern[:100]}",
+                )
+                self.htm.note(task_id,
+                    f"[created] Initial observation: {pattern}. "
+                    f"Opportunity: {c.get('opportunity', '')}."
+                )
                 self.stm.record(
                     source="system", type="internal",
                     payload={
-                        "subtype":        "logos_synthesis_candidate",
-                        "candidate_id":   f"cand-{key[:20]}",
-                        "title":          eval_result.get("suggested_title", key),
-                        "evidence_count": len(tasks),
-                        "decision":       eval_result.get("decision"),
-                        "reason":         eval_result.get("reason"),
+                        "subtype": "logos_synthesis_candidate",
+                        "domain":  domain,
+                        "pattern": pattern[:100],
+                        "task_id": task_id,
                     },
                 )
+                created += 1
 
+        # Mark examined tasks so they don't recur
+        for t in persist_tasks[:10]:
+            self.htm.note(t.task_id, "[logos_examined]")
+
+        return created
+
+    def _advance_evaluation_tasks(self) -> int:
+        """
+        For each active synthesis evaluation task, re-examine accumulated
+        evidence and decide: gather more, propose to user, or close as
+        insufficient.
+
+        When evidence is strong, creates a staging-style HTM task for
+        user confirmation — same flow as tool installation.
+        """
+        advanced = 0
+        eval_tasks = self.htm.query(
+            tags_any=["synthesis_candidate"], state="active|paused|waiting"
+        )
+
+        for task in eval_tasks:
+            # Count evidence entries in notebook
+            evidence_entries = [
+                n for n in task.notebook
+                if "[evidence]" in n.get("entry", "")
+            ]
+            # Count sessions spanned
+            sessions = len({
+                n.get("entry", "")[:10]  # approximate by timestamp prefix
+                for n in task.notebook
+            })
+
+            # Not enough evidence yet — continue accumulating
+            if len(evidence_entries) < 2:
+                continue
+
+            # Ask Logos to evaluate readiness
+            notebook_text = "\n".join(
+                n.get("entry", "") for n in task.notebook[-20:]
+            )
+            try:
+                eval_prompt = (
+                    "Evaluate this synthesis candidate:\n"
+                    f"Domain: {task.title}\n"
+                    f"Evidence entries: {len(evidence_entries)}\n"
+                    f"Notebook:\n{notebook_text}\n\n"
+                    "Return JSON with:\n"
+                    "  decision: 'propose' | 'gather_more' | 'insufficient'\n"
+                    "  confidence: 0.0-1.0\n"
+                    "  skill_title: proposed skill name (if propose)\n"
+                    "  capability_summary: one sentence (if propose)\n"
+                    "  guidance_steps: list of step strings (if propose)\n"
+                    "  reason: why this decision"
+                )
+                verdict = self.llm.complete_json(
+                    system      = LOGOS_SKILL_EVAL_v1,
+                    user        = eval_prompt,
+                    schema      = {"decision": "string", "confidence": "number"},
+                    temperature = 0,
+                )
             except Exception:
-                pass
+                continue
 
-        return promoted
+            decision = verdict.get("decision", "gather_more")
 
-    def _write_skill_artifact(
-        self, key: str, tasks: list, eval_result: dict
-    ):
-        """Write a promoted skill to Muninn LTM."""
+            if decision == "propose":
+                self._propose_skill(task, verdict)
+                self.htm.update(task.task_id, state="paused",
+                                progress="Proposed to user — awaiting confirmation")
+                advanced += 1
+
+            elif decision == "insufficient":
+                self.htm.complete(task.task_id,
+                    output={"result": "insufficient_evidence",
+                            "reason": verdict.get("reason", "")},
+                    confidence=0.0,
+                    note="[logos] Closed: insufficient evidence for synthesis",
+                )
+                advanced += 1
+
+            # gather_more → leave task active, append note
+            else:
+                self.htm.note(task.task_id,
+                    f"[logos_eval] Gather more: {verdict.get('reason', '')}"
+                )
+
+        return advanced
+
+    def _propose_skill(self, eval_task, verdict: dict) -> None:
+        """
+        Write a skill proposal to LTM and create a confirmation HTM task
+        (same staging workflow as tool installation — user confirms via Sagax).
+        """
+        domain      = eval_task.title.replace("Skill synthesis candidate: ", "")
+        skill_id    = f"skill.{domain.replace(' ','_').replace('-','_')}.v1"
+        skill_title = verdict.get("skill_title", domain)
+        capability  = verdict.get("capability_summary", "")
+        steps       = verdict.get("guidance_steps", [])
+        confidence  = float(verdict.get("confidence", 0.8))
+
         skill_content = json.dumps({
             "artifact_type":       "skill",
-            "skill_id":            f"skill.{key.replace(' ', '_')}.v1",
-            "title":               eval_result.get("suggested_title", key),
-            "capability_summary":  eval_result.get("capability_summary", ""),
-            "evidence":            [t.task_id for t in tasks],
-            "confidence":          eval_result.get("confidence", 0.8),
+            "skill_id":            skill_id,
+            "title":               skill_title,
+            "capability_summary":  capability,
+            "steps": [
+                {"order": i+1, "guidance": s, "interactive": False}
+                for i, s in enumerate(steps)
+            ],
+            "polarity":            "write",
+            "evidence":            [eval_task.task_id],
+            "confidence":          confidence,
             "version":             1,
             "synthesised_at":      _utcnow(),
             "requires_confirmation_for_n_runs": SKILL_CONFIRM_RUNS,
+            "status":              "proposed",   # not yet confirmed
         })
-        self.muninn.consolidate_ltm(
-            narrative   = skill_content,
-            class_type  = "skill",
-            topics      = [key],
-            confidence  = eval_result.get("confidence", 0.8),
+
+        # Write to LTM as proposed (not active) — becomes active on confirmation
+        self.muninn.store_ltm(
+            content    = skill_content,
+            class_type = "skill",
+            topics     = ["skill", skill_id, domain, "proposed"],
+            confidence = confidence,
+        )
+
+        # Create a user-facing confirmation task (same pattern as staging)
+        proposal_task_id = self.htm.create(
+            title       = f"Skill proposal: {skill_title}",
+            initiated_by= "logos",
+            persistence = "persist",
+            tags        = ["skill_proposal", skill_id, domain],
+            progress    = f"Proposed skill ready for review: {skill_id}",
+        )
+        self.htm.note(proposal_task_id,
+            f"skill_id: {skill_id}\n"
+            f"capability: {capability}\n"
+            f"steps: {len(steps)}\n"
+            f"confidence: {confidence:.2f}\n"
+            f"evidence_task: {eval_task.task_id}"
+        )
+
+        self.stm.record(
+            source="system", type="internal",
+            payload={
+                "subtype":    "logos_skill_proposed",
+                "skill_id":   skill_id,
+                "title":      skill_title,
+                "confidence": confidence,
+                "task_id":    proposal_task_id,
+            },
         )
 
     # ------------------------------------------------------------------

@@ -298,9 +298,10 @@ class _BuiltinProvider:
 class _ProviderToolAdapter:
     """Adapts a registered provider handler dict to the provider interface."""
 
-    def __init__(self, handlers: dict, htm):
-        self._h   = handlers
-        self._htm = htm
+    def __init__(self, handlers: dict, htm, role: str = ""):
+        self._h    = handlers
+        self._htm  = htm
+        self._role = role
 
     def _call(self, method: str, **kwargs):
         fn = self._h.get(method)
@@ -310,8 +311,11 @@ class _ProviderToolAdapter:
                 f"Available: {list(self._h)}"
             )
         import inspect
-        if "_htm" in inspect.signature(fn).parameters:
+        sig = inspect.signature(fn)
+        if "_htm" in sig.parameters:
             kwargs["_htm"] = self._htm
+        if "_role" in sig.parameters:
+            kwargs["_role"] = self._role
         return fn(**kwargs)
 
     def complete(self, **kw)       -> LLMResponse: return self._call("complete", **kw)
@@ -400,7 +404,9 @@ class LLMClient:
         timeout     = float(self.htm.states.get(f"{self.role}.timeout",     self._fb.timeout))
 
         if provider_id and provider_id in self._PROVIDERS:
-            return _ProviderToolAdapter(self._PROVIDERS[provider_id], self.htm), model, temp, timeout
+            return _ProviderToolAdapter(
+                self._PROVIDERS[provider_id], self.htm, role=self.role
+            ), model, temp, timeout
 
         self._fb.model = model
         return self._fb, model, temp, timeout
