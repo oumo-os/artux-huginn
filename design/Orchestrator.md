@@ -1,59 +1,198 @@
 # Orchestrator — Routing Bridge Specification
 
 **Repository:** `oumo-os/artux-huginn`  
-**Document status:** Living design spec — v1.0  
-**Companion document:** `design/CognitiveModule.md` v1.0
+**Document status:** Living design spec — v2.0  
+**Companion:** CognitiveModule.md v2.0
 
 ---
 
-## 0 — Purpose and Scope
+## 0 — Purpose
 
-The Orchestrator is the execution runtime sitting between Sagax and the rest of the system. It has **no cognitive logic**. It does not plan, reason, or make decisions about what to do. It routes signals, enforces contracts, and manages the lifecycle of a session.
+The Orchestrator is the execution runtime between Sagax and everything else. It has no cognitive logic — it routes, enforces, and manages lifecycle. Eight internal responsibilities:
 
-This document defines:
-- The Orchestrator's eight internal surfaces
-- Session model and permission gate
-- Token stream routing (full block-by-block specification)
-- Two-stage nudge protocol
-- `<aug_call>` dispatch and timeout handling
-- ASC garbage collection
-- Workbook lifecycle
-- HTM scheduler
+1. **Token stream router** — tag-state machine on Sagax Narrator output
+2. **Speech chunker** — publishes `partial`/`chunk`/`full` events to ActuationBus
+3. **Workbook writer** — full session ledger in ASC
+4. **Two-stage nudge** — Stage 1 halts TTS and closes open block as `full+interrupted`; Stage 2 delivers urgent context to Sagax
+5. **Permission gate** — validates every `<tool_call>` against session grants
+6. **`<aug_call>` handler** — parallel dispatch with per-tool timeouts; pauses Sagax generation
+7. **HTM scheduler** — `waiting→due`, `active→expired` at ~1 Hz
+8. **`on_consn_updated`** — triggered by Sagax after consN update; runs ASC GC with extracted topics/entities; archives workbook segment
 
 ---
 
-## 1 — Position in the Stack
+## 1 — Position in Stack
 
 ```
-Exilis ──────────────────────────────────→ STM (Muninn)
-   │                                          ↑
-   │ triage signal (ignore/act/urgent)        │ result events
-   ↓                                          │
-Orchestrator ←── Sagax Narrator token stream ─┘
+Exilis ──────────────────────────────────────────→ STM
+   │ triage signal                                   ↑
+   ↓                                                 │ output events
+Orchestrator ←── Sagax Narrator token stream ────────┘
    │
-   ├── Tool Manager (tool_call dispatch)
-   ├── TTS (speech streaming)
-   ├── UI (projection dispatch)
-   ├── HTM (task_update writes, scheduler)
-   └── ASC (workbook writes, hot cache updates)
+   ├── Speech chunker → ActuationBus (partial/chunk/full)
+   ├── Tool Manager   (tool_call dispatch)
+   ├── HTM            (task_update writes, states, scheduler)
+   └── ASC            (workbook, hot cache updates)
 ```
-
-**Data flows:**
-- Exilis → Orchestrator: triage signals, `urgent` interrupts
-- Sagax → Orchestrator: structured token stream (Narrator output)
-- Orchestrator → Tool Manager: validated `<tool_call>` blocks
-- Orchestrator → TTS: live-streamed `<speech>` tokens
-- Orchestrator → STM: STM events on block close (via `record_stm`)
-- Orchestrator → ASC: workbook entries, hot cache updates, GC
-- Orchestrator → HTM: task record writes, scheduler ticks
 
 ---
 
-## 2 — Session Model
+## 2 — Token Stream Router
 
-### 2.1 — Session Object
+```
+IDLE
+  → <thinking>/<think>  → CAPTURING_THINKING
+  → <contemplation>     → CAPTURING_CONTEMPLATION
+  → <speech>            → STREAMING_SPEECH
+  → <speech_step>       → STREAMING_SPEECH_STEP
+  → <tool_call>         → BUFFERING_TOOL_CALL
+  → <aug_call>          → BUFFERING_AUG_CALL
+  → <task_update>       → BUFFERING_TASK_UPDATE
+  → <projection>        → BUFFERING_PROJECTION
 
-The Orchestrator owns and maintains the active session object:
+CAPTURING_THINKING / CAPTURING_THINK:
+  → on close: discard — no STM, no workbook, no TTS
+
+STREAMING_SPEECH / STREAMING_SPEECH_STEP:
+  → per token: on_tts_token(token) + _feed_speech_chunk(token)
+    _feed_speech_chunk:
+      publishes partial to bus
+      publishes chunk to bus at phrase boundary (punctuation after min_tokens)
+  → on close: _publish_speech_full() + record STM output/speech + workbook
+
+BUFFERING_TOOL_CALL:
+  → on close: permission_check → Tool Manager dispatch → create/update HTM task
+
+BUFFERING_AUG_CALL:
+  → on close: validate all polarity:read → dispatch parallel with timeouts
+              inject <aug_result> → resume Sagax generation
+
+BUFFERING_TASK_UPDATE:
+  → on close: parse action (create|update|complete|park|state_set|state_get|state_delete)
+              write to HTM Tasks or HTM.States
+
+BUFFERING_PROJECTION:
+  → on close: dispatch to UI + record STM output/projection
+```
+
+---
+
+## 3 — Two-Stage Nudge (v2)
+
+When Exilis raises `urgent`:
+
+**Stage 1 — immediate halt (< 50ms):**
+
+| Narrator state | Action |
+|---|---|
+| `STREAMING_SPEECH` | Flush chunk buffer → ActuationBus `full+interrupted`. Write STM `output/speech status:full interrupted:true partial_text:"..."`. TTS sentinel. |
+| `STREAMING_SPEECH_STEP` | Same as above. Clear `_speech_step_pending`, unblock waiting thread. |
+| `BUFFERING_TOOL_CALL` | Discard buffer. Log `tool_call_aborted` to workbook. |
+| `BUFFERING_AUG_CALL` | Cancel pending futures. Inject `{"status":"nudge_interrupt"}` as aug_result. |
+| `IDLE` | No action needed. |
+
+All states → `IDLE`. Buffers zeroed.
+
+**Stage 2 — context delivery (< 50ms after Stage 1):**
+Deliver urgent event to Sagax's input queue. Wake with priority flag.
+
+**No `suspended` status exists in v2.** Everything in STM is `full`.
+
+---
+
+## 4 — ActuationBus Integration
+
+The Orchestrator publishes to the ActuationBus on all speech-related events:
+
+```python
+# Per token (STREAMING_SPEECH or STREAMING_SPEECH_STEP):
+bus.publish_dict(type="output", target="speech", complete="partial",
+                 text=token, session_id=session_id)
+
+# At phrase boundary (punctuation after _CHUNK_MIN_TOKENS):
+bus.publish_dict(type="output", target="speech", complete="chunk",
+                 text=accumulated_chunk, session_id=session_id)
+
+# At </speech> close (or nudge interrupt):
+bus.publish_dict(type="output", target="speech", complete="full",
+                 text=full_text, interrupted=interrupted, session_id=session_id)
+
+# At </contemplation> close:
+bus.publish_dict(type="output", target="contemplation", complete="full", ...)
+```
+
+Subscribers register filter dicts against these events. The bus is non-blocking — full subscriber queues drop silently rather than blocking the Orchestrator.
+
+---
+
+## 5 — `on_consn_updated(new_summary_text)`
+
+Called by Sagax after every successful consN update. The Orchestrator:
+
+1. Extracts topic words and named entities from `new_summary_text` (simple regex)
+2. Calls `htm.asc.gc(topics, entities)` — prunes stale hot topics, recalls, capabilities
+   - `hot_parameters` and `hot_entities[unresolved]` are **never pruned**
+3. Archives current workbook segment (marks consN session boundary)
+4. Writes `internal/consn_updated` event to STM
+
+This closes a v1 gap where ASC context accumulated indefinitely.
+
+---
+
+## 6 — `<task_update>` State Operations
+
+In addition to task lifecycle (`create|update|complete|park`), `<task_update>` supports state operations:
+
+```json
+{"action": "state_set",    "key": "sagax.model",  "value": "phi4"}
+{"action": "state_get",    "key": "sagax.model"}
+{"action": "state_get",    "prefix": "sagax"}
+{"action": "state_delete", "key": "session.quiet_mode"}
+```
+
+`state_set` writes to `HTM.states` and records an internal STM event. Logos flushes dirty states to LTM at session end. `state_get` with `prefix` returns the whole namespace.
+
+---
+
+## 7 — Permission Gate
+
+Every `<tool_call>` block is validated before Tool Manager dispatch:
+
+```python
+for scope in tool.permission_scope:
+    if scope in session.grants.denied:          → inject tool_result denied
+    if scope not in session.grants.permission:  → inject tool_result denied
+    if scope in session.grants.confirmation:    → emit speech confirmation; hold tool
+
+# <aug_call> blocks bypass the gate — polarity:read only
+# Attempting polarity:write in an <aug_call> → error result injected
+```
+
+New-skill confirmation: skills with `requires_confirmation_for_n_runs > 0` require explicit user confirmation before dispatch. Counter decrements on confirmed runs.
+
+---
+
+## 8 — HTM Scheduler
+
+Runs at ~1Hz in a daemon thread:
+
+```python
+for task in htm.query(state="waiting"):
+    if task.remind_at and task.remind_at <= now:
+        htm.update(task_id, state="due")
+        if session.active: orchestrator.nudge(reason="task_due", task_id=task_id)
+
+for task in htm.query(state="active"):
+    if task.expiry_at and task.expiry_at <= now:
+        htm.update(task_id, state="expired")
+        stm.record(internal, subtype="task_expired", task_id=...)
+```
+
+Every `<tool_call>` block creates or updates a minimal HTM task record (Logos reads these for skill synthesis traces).
+
+---
+
+## 9 — Session Model
 
 ```json
 {
@@ -62,405 +201,43 @@ The Orchestrator owns and maintains the active session object:
   "started_at":  "2026-03-09T07:00:00Z",
   "state":       "active | suspended | ended",
   "grants": {
-    "permission_scope":       ["microphone", "kettle", "lights", "calendar.read"],
+    "permission_scope":       ["microphone", "lights", "kettle"],
     "denied":                 ["camera", "email.send"],
-    "confirmation_required":  ["calendar.write", "file.delete", "kettle.set_temp_above_90"]
+    "confirmation_required":  ["calendar.write"]
   }
 }
 ```
 
-### 2.2 — Session Lifecycle
-
-```
-session.create(entity_id, grants)  → session_id; initialize ASC; open workbook
-session.suspend(reason)            → state = "suspended"; flush in-flight dispatches
-session.resume(session_id)         → state = "active"; Sagax reads HTM for resume points
-session.end(session_id)            → state = "ended"; archive workbook; notify Logos for ASC flush
-```
-
-Session end triggers:
-- Current workbook archived to cold storage.
-- `end_of_session` event written to STM.
-- Logos notified (via HTM task or direct signal) to perform final ASC flush.
-
-### 2.3 — Permission Gate
-
-The Orchestrator validates every `<tool_call>` against the active session grants **before** dispatching to the Tool Manager.
-
-```python
-def permission_check(tool_call_block, session):
-    for tool in tool_call_block.tools:
-        scope = tool.get("permission_scope", [])
-        for s in scope:
-            if s in session.grants.denied:
-                return deny(tool, reason="explicitly_denied")
-            if s not in session.grants.permission_scope:
-                return deny(tool, reason="scope_not_granted")
-            if s in session.grants.confirmation_required:
-                return require_confirmation(tool, session)
-    return allow()
-```
-
-**On `deny`:** Inject a `tool_result` event with `status:"denied"`, `reason`. Sagax reads this on next wake and reasons about the failure.
-
-**On `require_confirmation`:** Emit a `<speech>` confirmation request to the user. That tool is held; other tools in the same block that don't require confirmation proceed normally.
-
-**`<aug_call>` blocks bypass the permission gate** — they are `polarity:"read"` only. The `polarity` field on the tool descriptor is the enforcement point. If a tool with `polarity:"write"` appears in an `<aug_call>`, the Orchestrator rejects the block and injects an error result.
-
----
-
-## 3 — Token Stream Routing
-
-The Orchestrator operates a tag-state machine on Sagax's Narrator output. It processes the stream in real time, routing each block as it closes.
-
-### 3.1 — State Machine
-
-```
-IDLE
-  → on "<thinking>" open:      → CAPTURING_THINKING
-  → on "<contemplation>" open: → CAPTURING_CONTEMPLATION
-  → on "<speech" open:         → STREAMING_SPEECH
-  → on "<tool_call>" open:     → BUFFERING_TOOL_CALL
-  → on "<aug_call" open:       → BUFFERING_AUG_CALL
-  → on "<task_update" open:    → BUFFERING_TASK_UPDATE
-  → on "<projection>" open:    → BUFFERING_PROJECTION
-
-CAPTURING_THINKING
-  → on close:   write to debug log only; IDLE
-
-CAPTURING_CONTEMPLATION
-  → on close:   record_stm(output/contemplation);
-                workbook_write(block);
-                IDLE
-
-STREAMING_SPEECH
-  → while open: stream tokens to TTS live
-  → on close:   record_stm(output/speech, status:"complete");
-                workbook_write(block);
-                IDLE
-  → on NUDGE:   write status:"suspended", resume_point to in-progress speech event;
-                halt TTS; IDLE
-
-BUFFERING_TOOL_CALL
-  → on close:   result = permission_check(block, session)
-                if allow:
-                    dispatch_to_tool_manager(block)
-                    create_or_update_htm_task(block)
-                    workbook_write(block)
-                if deny:
-                    inject_tool_result_denied(block)
-                    workbook_write(block)
-                IDLE
-
-BUFFERING_AUG_CALL
-  → on close:   validate_all_read_polarity(block)
-                dispatch_parallel_with_timeouts(block)
-                inject_aug_result(results)
-                workbook_write(block)
-                IDLE
-
-BUFFERING_TASK_UPDATE
-  → on close:   htm_write(block)
-                workbook_write(block)
-                IDLE
-
-BUFFERING_PROJECTION
-  → on close:   dispatch_to_ui(block)
-                record_stm(output/projection)
-                workbook_write(block)
-                IDLE
-```
-
-### 3.2 — Workbook Write Contract
-
-On every block close (except `<thinking>`), the Orchestrator writes the full payload to `ASC.workbook`:
-
-```json
-{
-  "ts":         "2026-03-09T07:15:00Z",
-  "block_type": "tool_call | aug_call | contemplation | speech | task_update | projection",
-  "content":    { /* full raw block content */ },
-  "result":     { /* dispatch result if applicable; null for contemplation/speech */ },
-  "session_id": "sess-2026-03-09-morning"
-}
-```
-
-`<thinking>` blocks are **never** written to the workbook.
-
----
-
-## 4 — Two-Stage Nudge Protocol
-
-When Exilis raises an `urgent` triage signal mid-Sagax generation:
-
-### Stage 1 — Immediate halt (target < 50 ms)
-
-1. Halt TTS output.
-2. If current state is `STREAMING_SPEECH`: write `status:"suspended"` and `resume_point` to the in-progress STM speech event.
-3. If current state is `BUFFERING_TOOL_CALL`: discard buffer; write `tool_call_aborted` to workbook.
-4. If current state is `BUFFERING_AUG_CALL`: cancel pending aug dispatches; inject `{"status": "nudge_interrupt"}` as `<aug_result>`.
-5. Transition to `IDLE`. Freeze further dispatch.
-
-### Stage 2 — Context delivery (target < 50 ms after Stage 1)
-
-1. Deliver the urgent STM event to Sagax's input queue.
-2. Wake Sagax with priority flag.
-3. Sagax reads the new event and decides whether to resume, pivot, or park the task.
-
-### Nudge sources
-
-- Exilis `urgent` triage (departure, emergency sensor, urgent user speech)
-- HTM scheduler tick raising a `due` task requiring immediate Sagax attention
-- Operator-injected interrupt
-
----
-
-## 5 — `<aug_call>` Dispatch
-
-### 5.1 — Dispatch Flow
-
-```python
-def handle_aug_call(block):
-    # 1. Validate read polarity
-    for tool in block.tools:
-        descriptor = recall_tool_descriptor(tool.name)
-        if descriptor.polarity != "read":
-            inject_aug_result({
-                "status": "error",
-                "reason": "aug_call_write_tool_rejected",
-                "tool":   tool.name
-            })
-            return
-
-    # 2. Resolve per-tool timeouts
-    block_timeout = block.attributes.get("timeout_ms", 500)
-    for tool in block.tools:
-        tool.effective_timeout = tool.args.pop("timeout_ms", block_timeout)
-
-    # 3. Dispatch all in parallel; Sagax generation paused here
-    futures = [dispatch_async(tool) for tool in block.tools]
-
-    # 4. Collect results (each independently timed out)
-    results = {}
-    for tool, future in zip(block.tools, futures):
-        try:
-            results[tool.name] = future.result(timeout=tool.effective_timeout / 1000)
-        except TimeoutError:
-            results[tool.name] = {"status": "timeout", "tool": tool.name}
-        except Exception as e:
-            results[tool.name] = {"status": "error", "tool": tool.name, "reason": str(e)}
-
-    # 5. Inject <aug_result> inline; resume Sagax generation
-    inject_aug_result(results)
-
-    # 6. Write to workbook
-    workbook_write({"block_type": "aug_call", "tools": [t.name for t in block.tools], "results": results})
-```
-
-### 5.2 — Timeout Semantics
-
-| Scenario | Behaviour |
-|---|---|
-| Per-tool `timeout_ms` declared | Overrides block-level default for that tool |
-| Block-level `timeout_ms` only | All tools use the block-level value |
-| No timeout declared anywhere | Default: 500 ms |
-| Individual tool times out | `{"status": "timeout", "tool": "n"}` in `<aug_result>`; others proceed normally |
-| All tools time out | Full `<aug_result>` is all timeouts; Sagax generation resumes; Sagax handles gracefully |
-| Nudge arrives mid-aug_call | Cancel all pending futures; inject `{"status": "nudge_interrupt"}`; proceed to Stage 2 |
-
-### 5.3 — Sagax Generation Pause
-
-Sagax generation is halted at `<aug_call>` close. The partial token stream is buffered. The Orchestrator injects `<aug_result>` into Sagax's input as inline context. Sagax then continues generating from the buffered position, incorporating the results before producing its next token.
-
----
-
-## 6 — ASC Garbage Collection
-
-### 6.1 — Trigger
-
-ASC GC is called by `orchestrator.on_consN_update(new_summary_text)`, invoked from the `update_consN` flow in `runtime/stm.py`.
-
-### 6.2 — GC Algorithm
-
-```python
-def asc_gc(new_consN_text):
-    new_topics   = extract_topics(new_consN_text)
-    new_entities = extract_entity_refs(new_consN_text)
-    active_tools = get_active_task_tool_hints()
-
-    # hot_topics: keep only topics in new consN context
-    asc.hot_topics = [t for t in asc.hot_topics if t in new_topics]
-
-    # hot_recalls: keep if query topics overlap new context
-    asc.hot_recalls = [r for r in asc.hot_recalls
-                       if any(t in new_topics for t in r.query_topics)]
-
-    # hot_tools: keep if referenced in new consN or in active HTM tasks
-    asc.hot_tools = [t for t in asc.hot_tools
-                     if t.tool_id in active_tools or t.referenced_in(new_consN_text)]
-
-    # hot_state: prune stale tool-specific state not in active tasks
-    asc.hot_state = prune_stale_tool_state(asc.hot_state, active_tools)
-
-    # hot_entities[confirmed]: prune if not in new consN entity refs
-    # hot_entities[unresolved/implied]: NEVER pruned — always retained
-    for entity in list(asc.hot_entities.values()):
-        if entity.status == "confirmed" and entity.entity_id not in new_entities:
-            del asc.hot_entities[entity.entity_id]
-
-    # Archive workbook segment; open new one
-    archive_workbook_segment(session_id=current_session_id)
-    asc.workbook = new_workbook_segment()
-```
-
-### 6.3 — Workbook Archival
-
-On each consN session boundary, the current workbook segment is archived:
-
-```json
-{
-  "archive_id":    "wb-sess-2026-03-09-morning-seg3",
-  "session_id":    "sess-2026-03-09-morning",
-  "segment":       3,
-  "consN_version": 7,
-  "archived_at":   "2026-03-09T09:30:00Z",
-  "entries":       [ /* all workbook entries for this segment */ ]
-}
-```
-
-**Retention policy:** Cold-archived workbook segments are retained until **both** of the following are true:
-1. Logos has examined the segment and called `htm.mark_consolidated()` on all relevant tasks.
-2. The configurable retention period has elapsed (default: 30 days).
-
-After both conditions, the segment is eligible for permanent deletion. Operators may override the retention period per deployment.
-
----
-
-## 7 — HTM Scheduler
-
-### 7.1 — Tick Loop
-
-The Orchestrator runs a scheduler tick at 1 Hz minimum:
-
-```python
-def scheduler_tick():
-    now = utcnow()
-
-    for task in htm.query(state="waiting"):
-        if task.remind_at and task.remind_at <= now:
-            htm.update(task.task_id, state="due")
-            if session.state == "active":
-                nudge(reason="task_due", task_id=task.task_id)
-
-    for task in htm.query(state="active"):
-        if task.expiry_at and task.expiry_at <= now:
-            htm.update(task.task_id, state="expired")
-            record_stm({
-                "type":    "internal",
-                "payload": {"subtype": "task_expired", "task_id": task.task_id}
-            })
-```
-
-### 7.2 — Minimal Task Record on `<tool_call>`
-
-Every `<tool_call>` block creates or updates a minimal HTM task record for Logos' synthesis trace:
-
-```python
-def on_tool_call_close(block, session):
-    active = htm.query(initiated_by="sagax", state="active",
-                       session_id=session.session_id)
-    if active:
-        htm.note(active[0].task_id,
-                 f"tool_call dispatched: {[t.name for t in block.tools]}")
-    else:
-        htm.create(
-            title=f"tool_call: {[t.name for t in block.tools]}",
-            initiated_by="sagax",
-            persistence="volatile",
-            tags=["tool_call_trace"]
-        )
-```
-
-Explicit `<task_update>` blocks from Sagax override and enrich these minimal records.
-
----
-
-## 8 — Hot Cache Updates
-
-| Event | ASC Update |
-|---|---|
-| Entity resolved via signature router | `hot_entities[entity_id]` updated: status="confirmed" |
-| Exilis flags `signature_unresolved` | `hot_entities["implied-N"]` created: embedding + confidence |
-| `<tool_call>` dispatched | `hot_tools[tool_id].last_used` updated |
-| `recall()` result in `<aug_call>` | `hot_recalls` entry added: `{query, top_k_results, ts}` |
-| `<speech>` to entity | `hot_entities[entity_id].last_addressed` updated |
-
----
-
-## 9 — Tool Manager Interface
-
-The Orchestrator dispatches to the Tool Manager via a structured request:
-
-```json
-{
-  "request_id":       "orch-req-001",
-  "tool_id":          "tool.set_ceiling_lights.v1",
-  "inputs":           { "colour": "warm_red", "brightness": 60 },
-  "modality":         "request",
-  "session_id":       "sess-2026-03-09-morning",
-  "permission_scope": ["lights.ceiling"],
-  "task_id":          "task-mood-001"
-}
-```
-
-All results — regardless of modality — return to **Exilis** as STM events, not directly to Sagax. The Orchestrator does not hold results; Exilis records them and they enter the new-event window Sagax reads on its next wake.
-
-**Modality handling:**
-
-| Modality | Orchestrator behaviour |
-|---|---|
-| `request` | Dispatch; Exilis records result on return |
-| `job` | Dispatch; Orchestrator polls; result emitted as STM event when complete |
-| `subscribe` | Open subscription; each callback pushes event to Exilis queue |
-| `stream` | Open bidirectional channel; stream events routed through Exilis |
+Session grants are loaded from the entity's LTM record when the Perception Manager confirms identity via signature matching.
 
 ---
 
 ## 10 — Observability
 
-The Orchestrator emits an `orchestrator_health` event to STM on each consN session boundary:
+The Orchestrator emits `orchestrator_health` to STM on each consN session boundary:
 
 ```json
 {
   "type":             "orchestrator_health",
-  "session_id":       "sess-2026-03-09-morning",
+  "session_id":       "...",
   "consN_version":    7,
-  "ts":               "2026-03-09T09:30:00Z",
   "tool_calls":       12,
   "aug_calls":        4,
   "aug_timeouts":     1,
   "nudges_issued":    1,
   "permission_denials": 0,
-  "asc_gc_pruned": {
-    "hot_topics": 3,
-    "hot_recalls": 2,
-    "hot_tools": 0,
-    "hot_entities_confirmed": 0
-  },
-  "asc_retained": {
-    "hot_entities_unresolved": 1
-  }
+  "asc_gc_pruned": {"hot_topics": 3, "hot_recalls": 2},
+  "asc_retained":  {"hot_entities_unresolved": 1}
 }
 ```
 
 ---
 
-## 11 — Open Questions
+## 11 — Open Items
 
 | # | Question | Status |
 |---|---|---|
-| 1 | **Workbook retention period** — default 30 days; should it be per-deployment or per-session configurable? | Open |
-| 2 | **Multi-tool `<tool_call>` partial failure** — if one tool in a multi-tool block fails, abort the block or continue with remaining tools? | Open (current intent: continue; each tool gets its own result event) |
-| 3 | **`<aug_call>` shared wall-clock budget** — one total timeout across all tools in the block. Deferred; per-tool override covers most practical cases. | v0.6 |
-| 4 | **Orchestrator sandboxing** — separate process from Sagax to enforce no-direct-LTM-write constraint? | Architecture decision |
-| 5 | **Session grant updates mid-session** — can grants be expanded verbally (e.g. user approves camera access)? Or must a new session be created? | Open |
+| 1 | `<aug_call>` shared wall-clock budget | Deferred v0.6 |
+| 2 | Multi-tool `<tool_call>` partial failure policy | Intent: continue; each tool gets own result |
+| 3 | Session grant mid-session update (e.g., camera approved verbally) | Open |
+| 4 | Orchestrator sandboxing (separate process from Sagax) | Architecture decision |
