@@ -20,9 +20,10 @@ Your only job is to decide whether Sagax (the reasoning agent) needs to
 respond to what just happened in the world.
 
 You are given:
-  CONTEXT     — a lossy rolling narrative of recent history (consN)
+  CONTEXT      — a lossy rolling narrative of recent history (consN)
+  SAGAX STATE  — current Sagax activity: active | waiting | paused
   ACTIVE TASKS — what Sagax is currently working on
-  NEW EVENTS  — what has just occurred, in full detail (chronological)
+  NEW EVENTS   — what has just occurred, in full detail (chronological)
 
 The last event in NEW EVENTS is the one that triggered this check.
 
@@ -55,6 +56,13 @@ Definitions:
              • An emergency or departure sensor event during active speech
              • Any safety-critical signal
 
+SAGAX STATE affects the act/urgent threshold:
+  active  — Sagax is mid-stream. Raise the bar: only use urgent for clear
+            interruptions (explicit stop, safety, departure). Substantive
+            new requests that can wait → use act (queued for natural pause).
+  paused  — Sagax was interrupted. Use act freely; urgent only if critical.
+  waiting — Normal thresholds apply.
+
 When in doubt between ignore and act: choose act.
 When in doubt between act and urgent: choose act.
 Only choose urgent when there is a clear reason to interrupt immediately.
@@ -63,6 +71,8 @@ Only choose urgent when there is a clear reason to interrupt immediately.
 EXILIS_TRIAGE_USER_v1 = """
 CONTEXT (older history — lossy):
 {cons_n_text}
+
+SAGAX STATE: {sagax_state}
 
 ACTIVE TASKS:
 {active_tasks}
@@ -79,27 +89,30 @@ The last event above triggered this check. Classify it.
 # ---------------------------------------------------------------------------
 
 CONS_N_SUMMARISE_v1 = """
-You are updating a rolling narrative summary of recent events for an AI
-assistant. The summary is intentionally lossy — your job is compression,
-not transcription.
+You are updating a rolling world narrative for an AI assistant.
+The narrative is intentionally lossy — your job is compression, not transcription.
+
+Input will be one of two forms:
+  cycle_notes  — Sagax's own per-cycle intent summaries (preferred input).
+                 These are already compressed; fold them into the narrative.
+  raw_events   — Fallback when no cycle notes exist. Compress these more
+                 aggressively; extract meaning, discard mechanics.
 
 Rules:
-  • The output must be strictly shorter than the input combined.
+  • Output must be strictly shorter than the input combined.
   • Preserve all named entities, their relationships, and outcomes.
-  • Preserve causal chains: what led to what.
-  • Collapse exact timestamps to relative references ("earlier", "just now").
-  • Merge repeated context (e.g. if "lights were set to warm" appears three
-    times, say it once with the final state).
-  • Drop filler, hedging, and procedural detail that carries no meaning.
-  • Do NOT fabricate anything not present in the input.
-  • Do NOT add commentary or explanation — output the narrative only.
+  • Preserve causal chains: what led to what, and why (from cycle notes).
+  • Collapse exact timestamps to relative references.
+  • Merge repeated context to its final state.
+  • Drop procedural mechanics (which tool, which arg). Keep intent and result.
+  • Do NOT fabricate. Do NOT add commentary. Output the narrative only.
 """
 
 CONS_N_SUMMARISE_USER_v1 = """
 EXISTING NARRATIVE:
 {existing_narrative}
 
-NEW EVENTS TO FOLD IN:
+NEW INPUT (cycle notes or raw events):
 {new_events}
 
 Output the updated narrative. No preamble.
@@ -252,6 +265,22 @@ Segmentation boundaries:
   • Causal arc completion — a goal was attempted and succeeded/failed
   • Time gap > ~5 minutes between events (unless clearly continuous)
   • Modality shift — speech followed by unrelated sensor events
+
+Cycle notes (source=sagax, type=cycle_note) are Sagax's own per-cycle intent
+summaries. They tell you WHY a sequence of tool calls happened — the reasoning
+and intent behind the mechanics. Use them to:
+  • Understand what a cluster of tool calls was trying to accomplish
+  • Determine causal arc boundaries (a cycle note marks a reasoning unit)
+  • Enrich narratives with Sagax's interpretation (attribute it: "Sagax judged...")
+  • Assign confidence: cycle note interpretations max at 0.80 (Sagax can be wrong)
+Do NOT treat cycle notes as factual sensor data. They are interpretive scaffolding.
+
+Contemplation events (source=system, type=output, subtype=contemplation) are
+Sagax's in-flight reasoning — the thinking that preceded a tool call or speech block.
+Use them to understand WHY a tool was called or WHY a particular response was given.
+Enrich narratives with reasoned intent (attribute as: "Sagax reasoned that...").
+Confidence cap: 0.75. Contemplations reflect Sagax's in-context world model, which
+may be incorrect. They add colour to sensor facts; they do not replace them.
 
 Typical batch → typical entries:
   30 events might produce 4–8 entries:
