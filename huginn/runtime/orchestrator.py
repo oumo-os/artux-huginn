@@ -13,9 +13,9 @@ No cognitive logic lives here. The Orchestrator:
   - Writes workbook entries on every block close
 
 Token stream state machine (Orchestrator.md §3):
-  IDLE → CAPTURING_THINKING | CAPTURING_CONTEMPLATION | STREAMING_SPEECH
-       | BUFFERING_TOOL_CALL | BUFFERING_AUG_CALL | BUFFERING_TASK_UPDATE
-       | BUFFERING_PROJECTION
+  IDLE → CAPTURING_THINKING | CAPTURING_CONTEMPLATION | CAPTURING_CYCLE_NOTE
+       | STREAMING_SPEECH | BUFFERING_TOOL_CALL | BUFFERING_AUG_CALL
+       | BUFFERING_TASK_UPDATE | BUFFERING_PROJECTION
 
 This file wires together all Huginn components. Instantiate Orchestrator
 last, passing in all other components.
@@ -81,11 +81,12 @@ class NarratorState:
     BUFFERING_TASK_UPDATE   = "BUFFERING_TASK_UPDATE"
     BUFFERING_PROJECTION    = "BUFFERING_PROJECTION"
     STREAMING_SPEECH_STEP   = "STREAMING_SPEECH_STEP"   # speech_step: streaming + waiting for user
+    CAPTURING_CYCLE_NOTE    = "CAPTURING_CYCLE_NOTE"     # per-cycle Sagax summary
 
 
 # Block open/close patterns
-_BLOCK_OPEN  = re.compile(r"<(thinking|think|contemplation|speech|speech_step|tool_call|aug_call|task_update|projection)(\s[^>]*)?>") 
-_BLOCK_CLOSE = re.compile(r"</(thinking|think|contemplation|speech|speech_step|tool_call|aug_call|task_update|projection)>")
+_BLOCK_OPEN  = re.compile(r"<(thinking|think|contemplation|cycle_note|speech|speech_step|tool_call|aug_call|task_update|projection)(\s[^>]*)?>")
+_BLOCK_CLOSE = re.compile(r"</(thinking|think|contemplation|cycle_note|speech|speech_step|tool_call|aug_call|task_update|projection)>")
 _TARGET_ATTR = re.compile(r'target="([^"]+)"')
 _TIMEOUT_ATTR = re.compile(r'timeout_ms="(\d+)"')
 _VAR_ATTR    = re.compile(r'var="([^"]+)"')
@@ -457,8 +458,12 @@ class Orchestrator:
             confirmation_required = confirmation_required or [],
         )
         self.htm.new_session(sid)
-        self.sagax.entity_id       = entity_id
-        self.sagax.permission_scope = permission_scope
+        self.sagax.entity_id           = entity_id
+        self.sagax.permission_scope     = permission_scope
+        self.sagax._current_session_id  = sid
+        # Clear any session task from the previous session so Sagax
+        # creates a fresh one on its first cycle.
+        self.sagax.invalidate_session_task()
         return sid
 
     def end_session(self):
@@ -535,6 +540,10 @@ class Orchestrator:
 
         self._narrator_state = NarratorState.IDLE
 
+        # Mark session task paused so the next triage cycle knows
+        # Sagax was interrupted rather than having finished cleanly.
+        self.sagax._update_session_task_state("paused")
+
         # Stage 2: deliver context and wake Sagax with priority
         self.sagax.wake(signal=type("WakeSignal", (), {
             "priority": "urgent", "event": event
@@ -584,6 +593,7 @@ class Orchestrator:
             "thinking":       NarratorState.CAPTURING_THINKING,
             "think":          NarratorState.CAPTURING_THINKING,   # model alias
             "contemplation":  NarratorState.CAPTURING_CONTEMPLATION,
+            "cycle_note":     NarratorState.CAPTURING_CYCLE_NOTE,
             "speech":         NarratorState.STREAMING_SPEECH,
             "speech_step":    NarratorState.STREAMING_SPEECH_STEP,
             "tool_call":      NarratorState.BUFFERING_TOOL_CALL,
@@ -622,6 +632,23 @@ class Orchestrator:
                 payload={"subtype": "contemplation", "text": content.strip()},
             )
             self.htm.asc.workbook_write("contemplation", content.strip())
+
+        elif tag == "cycle_note":
+            # Sagax's per-cycle intent summary. Written to STM only.
+            # NOT written to the workbook (that's the skill-gap trace).
+            # NOT published to ActuationBus. NOT sent to TTS.
+            # Consumed by: Sagax._update_cons_n (replaces raw-event compression)
+            #              Logos consolidation (intentional arc context)
+            text = content.strip()
+            if text:
+                self.stm.record(
+                    source="sagax", type="cycle_note",
+                    payload={
+                        "text":       text,
+                        "session_id": self.session.session_id,
+                        "entity_id":  self.session.entity_id,
+                    },
+                )
 
         elif tag == "speech":
             self._publish_speech_full(content.strip(), self._speech_target)
