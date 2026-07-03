@@ -109,10 +109,25 @@ class ToolManifest:
                   Service tools expose start(config)/stop()/handle(event) instead
                   of a single handle(**args) function.
 
-    direction   — "input"  : tool pushes events INTO STM (perception/ASR).
-                  "output" : tool receives events FROM the ActuationBus (TTS/display).
-                  "io"     : bidirectional (e.g. a screen agent that reads and writes).
-                  ""       : callable tool, no stream direction.
+    direction   — "capture" : NEW — produces raw sensor frames (audio, video, screen).
+                              Exposes get_queue() → Queue[CaptureFrame].
+                              Does NOT write STM. PM owns the dispatch loop.
+                  "process" : NEW — receives CaptureFrames from PM, writes STM.
+                              Exposes push(frame: CaptureFrame). PM calls it.
+                              No hardware dependency — receives prepared data.
+                  "input"   : legacy — tool owns its source AND writes STM
+                              (e.g. text UI keyboard reader).
+                  "output"  : tool receives events FROM the ActuationBus (TTS/display).
+                  "io"      : bidirectional (e.g. a screen agent that reads and writes).
+                  ""        : callable tool, no stream direction.
+
+    emits     — (capture tools) list of CaptureFrame kinds this tool produces.
+                e.g. ["audio_chunk"], ["video_frame"], ["screen_frame"]
+                PM uses this to build the fan-out routing table.
+
+    consumes  — (process tools) list of CaptureFrame kinds this tool wants.
+                e.g. ["audio_chunk"] for ASR, ["video_frame"] for face detection.
+                PM subscribes the tool to matching capture sources.
 
     subscriptions — (service output tools only) list of ActuationBus filter dicts.
                     Each filter specifies which STM output events to receive:
@@ -133,10 +148,13 @@ class ToolManifest:
     perception_capable: bool                 = False
     handler:            str                  = "handle"
     # Service tool fields
-    mode:               str                  = "callable"   # callable | service
-    direction:          str                  = ""           # input | output | io | ""
+    mode:               str                  = "callable"   # callable | service | provider
+    direction:          str                  = ""           # capture | process | input | output | io | ""
     subscriptions:      list[dict]           = field(default_factory=list)
     states:             dict[str, Any]       = field(default_factory=dict)
+    # Capture/process routing fields
+    emits:              list[str]            = field(default_factory=list)   # capture tools
+    consumes:           list[str]            = field(default_factory=list)   # process tools
 
     # Set by the scanner — not in YAML
     source_path:        str                  = ""
@@ -145,6 +163,14 @@ class ToolManifest:
     @property
     def is_service(self) -> bool:
         return self.mode == "service"
+
+    @property
+    def is_capture_tool(self) -> bool:
+        return self.direction == "capture"
+
+    @property
+    def is_process_tool(self) -> bool:
+        return self.direction == "process"
 
     @property
     def is_output_tool(self) -> bool:
@@ -171,6 +197,8 @@ class ToolManifest:
             "direction":          self.direction,
             "subscriptions":      self.subscriptions,
             "states":             self.states,
+            "emits":              self.emits,
+            "consumes":           self.consumes,
             "source_path":        self.source_path,
             "source_hash":        self.source_hash,
             "install_state":      "pending",
@@ -244,6 +272,17 @@ def parse_manifest(source_code: str, source_path: str = "") -> Optional[ToolMani
     if not isinstance(states_raw, dict):
         states_raw = {}
 
+    # Normalise emits/consumes to list of strings
+    def _norm_strlist(raw) -> list:
+        if isinstance(raw, list):
+            return [str(x) for x in raw]
+        if isinstance(raw, str) and raw.strip():
+            return [raw.strip()]
+        return []
+
+    emits_raw    = _norm_strlist(data.get("emits",    []))
+    consumes_raw = _norm_strlist(data.get("consumes", []))
+
     return ToolManifest(
         tool_id            = data["tool_id"],
         title              = data["title"],
@@ -259,6 +298,8 @@ def parse_manifest(source_code: str, source_path: str = "") -> Optional[ToolMani
         direction          = data.get("direction", ""),
         subscriptions      = subs,
         states             = states_raw,
+        emits              = emits_raw,
+        consumes           = consumes_raw,
         source_path        = source_path,
         source_hash        = source_hash,
     )

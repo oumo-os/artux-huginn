@@ -2492,6 +2492,651 @@ class TestSignatureResolutionTopics(unittest.TestCase):
 
 
 # ===========================================================================
+# TestNotebookEntries — typed task notebook notes
+# ===========================================================================
+
+class TestNotebookEntries(unittest.TestCase):
+
+    def test_add_note_default_type(self):
+        """Notes without note_type default to 'note'."""
+        htm = HTM()
+        tid = htm.create(title="test", initiated_by="sagax")
+        htm.note(tid, "something happened")
+        entries = htm.notebook_entries(tid)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["type"], "note")
+        self.assertEqual(entries[0]["entry"], "something happened")
+
+    def test_add_note_typed(self):
+        """note_type is stored in the entry."""
+        htm = HTM()
+        tid = htm.create(title="test", initiated_by="sagax")
+        htm.note(tid, "chose warm_red because Home Alone palette", note_type="decision")
+        htm.note(tid, "set_ceiling_lights returned ok", note_type="result")
+        htm.note(tid, "three tool attempts before finding correct light", note_type="evidence")
+
+        all_entries = htm.notebook_entries(tid)
+        self.assertEqual(len(all_entries), 3)
+
+        decisions = htm.notebook_entries(tid, note_type="decision")
+        self.assertEqual(len(decisions), 1)
+        self.assertIn("warm_red", decisions[0]["entry"])
+
+        evidence = htm.notebook_entries(tid, note_type="evidence")
+        self.assertEqual(len(evidence), 1)
+        self.assertIn("three tool attempts", evidence[0]["entry"])
+
+    def test_notebook_entries_filter_by_type(self):
+        """notebook_entries(note_type=X) only returns entries of that type."""
+        htm = HTM()
+        tid = htm.create(title="filter test", initiated_by="sagax")
+        for i in range(3):
+            htm.note(tid, f"checkpoint {i}", note_type="checkpoint")
+        for i in range(2):
+            htm.note(tid, f"decision {i}", note_type="decision")
+        htm.note(tid, "logos marker", note_type="logos_examined")
+
+        checkpoints = htm.notebook_entries(tid, note_type="checkpoint")
+        self.assertEqual(len(checkpoints), 3)
+
+        decisions = htm.notebook_entries(tid, note_type="decision")
+        self.assertEqual(len(decisions), 2)
+
+        logos = htm.notebook_entries(tid, note_type="logos_examined")
+        self.assertEqual(len(logos), 1)
+
+    def test_notebook_entries_limit(self):
+        """limit parameter caps returned entries."""
+        htm = HTM()
+        tid = htm.create(title="limit test", initiated_by="sagax")
+        for i in range(10):
+            htm.note(tid, f"entry {i}", note_type="observation")
+        last_five = htm.notebook_entries(tid, limit=5)
+        self.assertEqual(len(last_five), 5)
+        # Should return the last 5
+        self.assertEqual(last_five[-1]["entry"], "entry 9")
+
+    def test_notebook_entries_empty_task(self):
+        """Unknown task_id returns empty list."""
+        htm = HTM()
+        result = htm.notebook_entries("nonexistent-id")
+        self.assertEqual(result, [])
+
+    def test_task_update_note_action(self):
+        """<task_update action='note'> writes a typed note via Orchestrator."""
+        muninn = MockMuninn()
+        h      = _build_huginn_with_mock_llm(muninn=muninn)
+        orch   = h.orchestrator
+        orch.session.session_id = "test"
+
+        tid = h.htm.create(title="skill test", initiated_by="sagax")
+
+        import json
+        orch._handle_task_update(json.dumps({
+            "action":    "note",
+            "task_id":   tid,
+            "note":      "[step:2] Found kitchen light via recall",
+            "note_type": "checkpoint",
+        }))
+
+        entries = h.htm.notebook_entries(tid, note_type="checkpoint")
+        self.assertEqual(len(entries), 1)
+        self.assertIn("[step:2]", entries[0]["entry"])
+
+    def test_task_update_note_action_default_type(self):
+        """action='note' without note_type defaults to 'note'."""
+        muninn = MockMuninn()
+        h      = _build_huginn_with_mock_llm(muninn=muninn)
+        orch   = h.orchestrator
+        orch.session.session_id = "test"
+
+        import json
+        tid = h.htm.create(title="default note", initiated_by="sagax")
+        orch._handle_task_update(json.dumps({
+            "action":  "note",
+            "task_id": tid,
+            "note":    "general observation",
+        }))
+
+        entries = h.htm.notebook_entries(tid)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["type"], "note")
+
+    def test_evidence_notes_filter_in_logos(self):
+        """Logos synthesis scan should find evidence-typed notes."""
+        muninn = MockMuninn()
+        h      = _build_huginn_with_mock_llm(muninn=muninn)
+
+        # Create an evaluation task with typed evidence entries
+        tid = h.htm.create(
+            title       = "Skill synthesis candidate: kitchen_lighting",
+            initiated_by= "logos",
+            persistence = "persist",
+            tags        = ["synthesis_candidate",
+                           "synthesis_candidate.kitchen_lighting"],
+            progress    = "tracking",
+        )
+        h.htm.note(tid, "first friction pattern observed", note_type="evidence")
+        h.htm.note(tid, "second pattern, same issue", note_type="evidence")
+        h.htm.note(tid, "logos already looked at this", note_type="logos_examined")
+
+        # Only evidence entries should trigger the advance logic
+        evidence = h.htm.notebook_entries(tid, note_type="evidence")
+        self.assertEqual(len(evidence), 2)
+
+        # Logos advance should see 2 evidence entries
+        h.logos.llm.complete_json = lambda **kw: {
+            "decision":           "gather_more",
+            "confidence":         0.4,
+            "reason":             "only 2 evidence entries so far",
+        }
+        # Should not raise
+        h.logos._advance_evaluation_tasks()
+
+
+# ===========================================================================
+# TestCognitiveStates — sagax.state and logos.state in HTM.states
+# ===========================================================================
+
+class TestCognitiveStates(unittest.TestCase):
+
+    def test_sagax_state_set_on_contemplation(self):
+        """<contemplation> block open sets sagax.state='contemplating'."""
+        muninn = MockMuninn()
+        h      = _build_huginn_with_mock_llm(muninn=muninn)
+        orch   = h.orchestrator
+        orch.session.session_id = "test"
+
+        # Open a contemplation block
+        orch._on_block_open("contemplation", "")
+        self.assertEqual(h.htm.states.get("sagax.state"), "contemplating")
+
+    def test_sagax_state_set_on_speech(self):
+        """<speech> block open sets sagax.state='speaking'."""
+        muninn = MockMuninn()
+        h      = _build_huginn_with_mock_llm(muninn=muninn)
+        orch   = h.orchestrator
+        orch.session.session_id = "test"
+
+        orch._on_block_open("speech", 'target="user"')
+        self.assertEqual(h.htm.states.get("sagax.state"), "speaking")
+
+    def test_sagax_state_set_on_tool_call(self):
+        """<tool_call> block open sets sagax.state='tool_wait'."""
+        muninn = MockMuninn()
+        h      = _build_huginn_with_mock_llm(muninn=muninn)
+        orch   = h.orchestrator
+        orch.session.session_id = "test"
+
+        orch._on_block_open("tool_call", "")
+        self.assertEqual(h.htm.states.get("sagax.state"), "tool_wait")
+
+    def test_sagax_state_set_on_aug_call(self):
+        """<aug_call> block open sets sagax.state='aug_wait'."""
+        muninn = MockMuninn()
+        h      = _build_huginn_with_mock_llm(muninn=muninn)
+        orch   = h.orchestrator
+        orch.session.session_id = "test"
+
+        orch._on_block_open("aug_call", 'timeout_ms="400"')
+        self.assertEqual(h.htm.states.get("sagax.state"), "aug_wait")
+
+    def test_sagax_state_thinking_after_block_close(self):
+        """After any block closes, sagax.state returns to 'thinking'."""
+        muninn = MockMuninn()
+        h      = _build_huginn_with_mock_llm(muninn=muninn)
+        orch   = h.orchestrator
+        orch.session.session_id = "test"
+
+        # Open and close a speech block
+        orch._on_block_open("speech", 'target="user"')
+        self.assertEqual(h.htm.states.get("sagax.state"), "speaking")
+
+        # Close it — should go back to thinking
+        orch._speech_target = "user"
+        orch._on_block_close("speech", "Hello world")
+        self.assertEqual(h.htm.states.get("sagax.state"), "thinking")
+
+    def test_sagax_state_thinking_on_wake(self):
+        """Orchestrator sets sagax.state='thinking' when Sagax wakes."""
+        muninn = MockMuninn()
+        h      = _build_huginn_with_mock_llm(muninn=muninn)
+        orch   = h.orchestrator
+        orch.session.session_id = "test"
+
+        # Force sleep state first
+        h.htm.states.set("sagax.state", "sleep")
+
+        # Mock sagax.wake so we don't actually start a cycle
+        h.sagax.wake = lambda **kw: None
+        orch._on_exilis_act()
+
+        self.assertEqual(h.htm.states.get("sagax.state"), "thinking")
+
+    def test_logos_state_set_during_pass(self):
+        """Logos._pass() writes logos.state=consolidating at start."""
+        muninn = MockMuninn()
+        h      = _build_huginn_with_mock_llm(muninn=muninn)
+
+        # Run a pass
+        h.logos._pass()
+
+        # After pass ends, logos.state should be sleep
+        self.assertEqual(h.htm.states.get("logos.state"), "sleep")
+
+    def test_cognitive_states_appear_first_in_summary(self):
+        """HTMStates.summary() must show sagax.state and logos.state first."""
+        htm = HTM()
+        htm.states.set("sagax.state", "speaking")
+        htm.states.set("logos.state", "sleep")
+        htm.states.set("tool.tts.kokoro.v1.speed", 1.4)
+        htm.states.set("sagax.model", "phi4")
+
+        summary = htm.states.summary()
+        lines = summary.strip().splitlines()
+
+        # First two lines should be sagax.state and logos.state (order may vary)
+        first_two = " ".join(lines[:2])
+        self.assertIn("sagax.state", first_two,
+            "sagax.state should appear in first two lines of summary")
+        self.assertIn("logos.state", first_two,
+            "logos.state should appear in first two lines of summary")
+
+    def test_sagax_state_is_not_dirty(self):
+        """Cognitive state writes must not be marked dirty (transient — not persisted)."""
+        muninn = MockMuninn()
+        h      = _build_huginn_with_mock_llm(muninn=muninn)
+        orch   = h.orchestrator
+        orch.session.session_id = "test"
+
+        orch._on_block_open("contemplation", "")
+        dirty = h.htm.states.dirty_keys()
+        self.assertNotIn("sagax.state", dirty,
+            "sagax.state should not be dirty — it is transient, not persisted to LTM")
+
+    def test_logos_state_is_not_dirty(self):
+        """logos.state writes must not be marked dirty."""
+        muninn = MockMuninn()
+        h      = _build_huginn_with_mock_llm(muninn=muninn)
+
+        h.logos._pass()
+        dirty = h.htm.states.dirty_keys()
+        self.assertNotIn("logos.state", dirty,
+            "logos.state should not be dirty — it is transient, not persisted to LTM")
+
+    def test_state_snapshot_contains_cognitive_states(self):
+        """STATE SNAPSHOT injected into Sagax must show cognitive states."""
+        htm = HTM()
+        htm.states.set("sagax.state", "thinking", mark_dirty=False)
+        htm.states.set("logos.state", "sleep",    mark_dirty=False)
+        htm.states.set("sagax.model", "phi4",     mark_dirty=False)
+
+        snapshot = htm.states.summary()
+        self.assertIn("sagax.state", snapshot)
+        self.assertIn("logos.state", snapshot)
+        # Both cognitive states in the first 200 chars (appear early)
+        self.assertIn("sagax.state", snapshot[:200])
+        self.assertIn("logos.state", snapshot[:200])
+
+
+# ===========================================================================
+# TestCaptureProcessArchitecture — fan-out dispatch, CaptureFrame routing
+# ===========================================================================
+
+class TestCaptureProcessArchitecture(unittest.TestCase):
+
+    def test_capture_frame_construction(self):
+        """CaptureFrame has kind, data, ts, meta fields."""
+        from huginn.runtime.perception import CaptureFrame
+        f = CaptureFrame(kind="audio_chunk", data=b"raw", meta={"sample_rate": 16000})
+        self.assertEqual(f.kind, "audio_chunk")
+        self.assertEqual(f.data, b"raw")
+        self.assertEqual(f.meta["sample_rate"], 16000)
+        self.assertTrue(len(f.ts) > 0, "ts should be auto-populated")
+
+    def test_capture_frame_ts_auto_populated(self):
+        """ts is set to current UTC time when not provided."""
+        from huginn.runtime.perception import CaptureFrame
+        f = CaptureFrame(kind="video_frame", data=None)
+        self.assertIn("T", f.ts)   # ISO format contains T
+
+    def test_manifest_emits_parses(self):
+        """Manifest with emits: [audio_chunk] is parsed correctly."""
+        from huginn.runtime.tool_discovery import parse_manifest
+        src = "\n".join([
+            '"""', "HUGINN_MANIFEST",
+            "tool_id:   tool.capture.test.v1",
+            "title:     Test Capture",
+            "capability_summary: test capture tool",
+            "polarity:  read",
+            "permission_scope: []",
+            "mode:      service",
+            "direction: capture",
+            "emits:",
+            "  - audio_chunk",
+            "inputs: {}",
+            "END_MANIFEST",
+            '"""', "",
+        ])
+        m = parse_manifest(src, "/fake/path.py")
+        self.assertIsNotNone(m)
+        self.assertEqual(m.direction, "capture")
+        self.assertIn("audio_chunk", m.emits)
+        self.assertTrue(m.is_capture_tool)
+
+    def test_manifest_consumes_parses(self):
+        """Manifest with consumes: [audio_chunk] is parsed correctly."""
+        from huginn.runtime.tool_discovery import parse_manifest
+        src = "\n".join([
+            '"""', "HUGINN_MANIFEST",
+            "tool_id:   tool.process.test.v1",
+            "title:     Test Processor",
+            "capability_summary: test processor tool",
+            "polarity:  write",
+            "permission_scope: []",
+            "mode:      service",
+            "direction: process",
+            "consumes:",
+            "  - audio_chunk",
+            "inputs: {}",
+            "END_MANIFEST",
+            '"""', "",
+        ])
+        m = parse_manifest(src, "/fake/path.py")
+        self.assertIsNotNone(m)
+        self.assertEqual(m.direction, "process")
+        self.assertIn("audio_chunk", m.consumes)
+        self.assertTrue(m.is_process_tool)
+
+    def test_tool_descriptor_carries_emits_consumes(self):
+        """install_tool copies emits/consumes into ToolDescriptor."""
+        import tempfile, os
+        from huginn.runtime.tool_discovery import parse_manifest
+
+        capture_src = "\n".join([
+            '"""', "HUGINN_MANIFEST",
+            "tool_id:   tool.capture.mic.test",
+            "title:     Mic Test",
+            "capability_summary: test",
+            "polarity:  read",
+            "permission_scope: []",
+            "mode:      service",
+            "direction: capture",
+            "emits:",
+            "  - audio_chunk",
+            "inputs: {}",
+            "END_MANIFEST",
+            '"""', "",
+            "import queue",
+            "_q = queue.Queue()",
+            "def start(config): pass",
+            "def stop(): pass",
+            "def get_queue(): return _q",
+        ])
+        tmp = tempfile.mkdtemp()
+        src_path = os.path.join(tmp, "tool_capture_mic_test.py")
+        open(src_path, "w").write(capture_src)
+
+        manifest = parse_manifest(capture_src, src_path)
+        self.assertIsNotNone(manifest)
+
+        muninn = MockMuninn()
+        h      = _build_huginn_with_mock_llm(muninn=muninn)
+        h.tool_manager.install_tool(manifest=manifest, stm=h.stm, htm=h.htm)
+
+        desc = h.tool_manager.get_descriptor("tool.capture.mic.test")
+        self.assertIsNotNone(desc)
+        self.assertEqual(desc.direction, "capture")
+        self.assertIn("audio_chunk", desc.emits)
+
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_fan_frame_reaches_processor(self):
+        """PM.fan_frame dispatches CaptureFrame to registered processor."""
+        from huginn.runtime.perception import PerceptionManager, CaptureFrame, ToolRegistry
+        import tempfile, os
+        from huginn.runtime.tool_discovery import parse_manifest
+
+        muninn = MockMuninn()
+        h      = _build_huginn_with_mock_llm(muninn=muninn)
+        pm     = h.perception
+
+        received_frames = []
+
+        # Register a fake processor push_fn in the fanout directly
+        pm._fanout = {"audio_chunk": [lambda f: received_frames.append(f)]}
+
+        frame = CaptureFrame(kind="audio_chunk", data=b"test_audio")
+        pm.fan_frame(frame)
+
+        self.assertEqual(len(received_frames), 1)
+        self.assertEqual(received_frames[0].data, b"test_audio")
+
+    def test_fan_frame_routes_by_kind(self):
+        """fan_frame only dispatches to processors matching the frame kind."""
+        from huginn.runtime.perception import PerceptionManager, CaptureFrame
+
+        muninn = MockMuninn()
+        h      = _build_huginn_with_mock_llm(muninn=muninn)
+        pm     = h.perception
+
+        audio_received = []
+        video_received = []
+
+        pm._fanout = {
+            "audio_chunk":  [lambda f: audio_received.append(f)],
+            "video_frame":  [lambda f: video_received.append(f)],
+        }
+
+        audio_frame = CaptureFrame(kind="audio_chunk", data=b"audio")
+        video_frame = CaptureFrame(kind="video_frame", data=b"video")
+
+        pm.fan_frame(audio_frame)
+        self.assertEqual(len(audio_received), 1)
+        self.assertEqual(len(video_received), 0)
+
+        pm.fan_frame(video_frame)
+        self.assertEqual(len(audio_received), 1)
+        self.assertEqual(len(video_received), 1)
+
+    def test_fan_frame_multiple_processors_same_kind(self):
+        """Multiple processors for the same kind all receive the frame."""
+        from huginn.runtime.perception import CaptureFrame
+
+        muninn = MockMuninn()
+        h      = _build_huginn_with_mock_llm(muninn=muninn)
+        pm     = h.perception
+
+        received_a = []
+        received_b = []
+
+        pm._fanout = {
+            "audio_chunk": [
+                lambda f: received_a.append(f),
+                lambda f: received_b.append(f),
+            ]
+        }
+
+        frame = CaptureFrame(kind="audio_chunk", data=b"shared")
+        pm.fan_frame(frame)
+
+        self.assertEqual(len(received_a), 1)
+        self.assertEqual(len(received_b), 1)
+        # Both received the exact same frame object
+        self.assertIs(received_a[0], received_b[0])
+
+    def test_fan_frame_processor_failure_doesnt_stop_others(self):
+        """If one processor raises, the remaining processors still receive."""
+        from huginn.runtime.perception import CaptureFrame
+
+        muninn = MockMuninn()
+        h      = _build_huginn_with_mock_llm(muninn=muninn)
+        pm     = h.perception
+
+        good_received = []
+
+        def bad_processor(f):
+            raise RuntimeError("processor failed")
+
+        pm._fanout = {
+            "audio_chunk": [
+                bad_processor,
+                lambda f: good_received.append(f),
+            ]
+        }
+
+        frame = CaptureFrame(kind="audio_chunk", data=b"test")
+        pm.fan_frame(frame)   # must not raise
+
+        self.assertEqual(len(good_received), 1,
+            "Good processor should receive frame even if earlier one fails")
+
+    def test_world_descriptors_returns_all(self):
+        """world_descriptors() returns all installed world-tier tools."""
+        muninn = MockMuninn()
+        h      = _build_huginn_with_mock_llm(muninn=muninn)
+        descs  = h.tool_manager.world_descriptors()
+        self.assertIsInstance(descs, list)
+
+    def test_direction_properties(self):
+        """ToolManifest direction properties are correct."""
+        from huginn.runtime.tool_discovery import parse_manifest
+
+        cases = [
+            ("capture", "audio_chunk", [], True,  False),
+            ("process", None, "audio_chunk", False, True),
+        ]
+        for direction, emit, consume, is_cap, is_proc in cases:
+            lines = [
+                '"""', "HUGINN_MANIFEST",
+                f"tool_id:   tool.dir.{direction}.v1",
+                "title:     Dir test",
+                "capability_summary: test",
+                "polarity:  read",
+                "permission_scope: []",
+                "mode:      service",
+                f"direction: {direction}",
+            ]
+            if emit:
+                lines += ["emits:", f"  - {emit}"]
+            if consume:
+                lines += ["consumes:", f"  - {consume}"]
+            lines += ["inputs: {}", "END_MANIFEST", '"""', ""]
+            src = "\n".join(lines)
+            m = parse_manifest(src, "/fake.py")
+            self.assertIsNotNone(m, f"manifest for direction={direction} failed to parse")
+            self.assertEqual(m.is_capture_tool, is_cap,  f"is_capture wrong for {direction}")
+            self.assertEqual(m.is_process_tool, is_proc, f"is_process wrong for {direction}")
+
+    def test_capture_microphone_manifest_parses(self):
+        """tool.capture.microphone.v1 manifest parses with correct fields."""
+        import os
+        src_path = os.path.join(
+            os.path.dirname(__file__), "..", "tools", "builtin",
+            "tool_capture_microphone.py",
+        )
+        if not os.path.exists(src_path):
+            self.skipTest("tool_capture_microphone.py not found")
+        from huginn.runtime.tool_discovery import parse_manifest
+        src = open(src_path).read()
+        m   = parse_manifest(src, src_path)
+        self.assertIsNotNone(m)
+        self.assertEqual(m.tool_id, "tool.capture.microphone.v1")
+        self.assertEqual(m.direction, "capture")
+        self.assertIn("audio_chunk", m.emits)
+        self.assertEqual(m.consumes, [])
+        self.assertTrue(m.is_capture_tool)
+        self.assertFalse(m.is_process_tool)
+
+    def test_capture_camera_manifest_parses(self):
+        """tool.capture.camera.v1 manifest parses with correct fields."""
+        import os
+        src_path = os.path.join(
+            os.path.dirname(__file__), "..", "tools", "builtin",
+            "tool_capture_camera.py",
+        )
+        if not os.path.exists(src_path):
+            self.skipTest("tool_capture_camera.py not found")
+        from huginn.runtime.tool_discovery import parse_manifest
+        src = open(src_path).read()
+        m   = parse_manifest(src, src_path)
+        self.assertIsNotNone(m)
+        self.assertEqual(m.tool_id, "tool.capture.camera.v1")
+        self.assertEqual(m.direction, "capture")
+        self.assertIn("video_frame", m.emits)
+        self.assertTrue(m.is_capture_tool)
+
+    def test_moonshine_processor_manifest_parses(self):
+        """Rewritten Moonshine tool has direction=process and consumes=[audio_chunk]."""
+        import os
+        src_path = os.path.join(
+            os.path.dirname(__file__), "..", "tools", "builtin",
+            "tool_asr_moonshine.py",
+        )
+        if not os.path.exists(src_path):
+            self.skipTest("tool_asr_moonshine.py not found")
+        from huginn.runtime.tool_discovery import parse_manifest
+        src = open(src_path).read()
+        m   = parse_manifest(src, src_path)
+        self.assertIsNotNone(m)
+        self.assertEqual(m.direction, "process")
+        self.assertIn("audio_chunk", m.consumes)
+        self.assertEqual(m.emits, [])
+        self.assertTrue(m.is_process_tool)
+        self.assertFalse(m.is_capture_tool)
+
+    def test_voice_identity_manifest_parses(self):
+        """Voice identity tool has direction=process and consumes=[audio_chunk]."""
+        import os
+        src_path = os.path.join(
+            os.path.dirname(__file__), "..", "tools", "staging",
+            "tool_identity_voice.py",
+        )
+        if not os.path.exists(src_path):
+            self.skipTest("tool_identity_voice.py not found")
+        from huginn.runtime.tool_discovery import parse_manifest
+        src = open(src_path).read()
+        m   = parse_manifest(src, src_path)
+        self.assertIsNotNone(m)
+        self.assertEqual(m.tool_id, "tool.identity.voice.v1")
+        self.assertEqual(m.direction, "process")
+        self.assertIn("audio_chunk", m.consumes)
+
+    def test_face_identity_manifest_parses(self):
+        """Face identity tool has direction=process and consumes=[video_frame]."""
+        import os
+        src_path = os.path.join(
+            os.path.dirname(__file__), "..", "tools", "staging",
+            "tool_identity_face.py",
+        )
+        if not os.path.exists(src_path):
+            self.skipTest("tool_identity_face.py not found")
+        from huginn.runtime.tool_discovery import parse_manifest
+        src = open(src_path).read()
+        m   = parse_manifest(src, src_path)
+        self.assertIsNotNone(m)
+        self.assertEqual(m.tool_id, "tool.identity.face.v1")
+        self.assertEqual(m.direction, "process")
+        self.assertIn("video_frame", m.consumes)
+
+    def test_old_moonshine_service_direction_gone(self):
+        """Moonshine no longer has direction=input (was the legacy path)."""
+        import os
+        src_path = os.path.join(
+            os.path.dirname(__file__), "..", "tools", "builtin",
+            "tool_asr_moonshine.py",
+        )
+        if not os.path.exists(src_path):
+            self.skipTest("tool_asr_moonshine.py not found")
+        from huginn.runtime.tool_discovery import parse_manifest
+        src = open(src_path).read()
+        m   = parse_manifest(src, src_path)
+        self.assertNotEqual(m.direction, "input",
+            "Moonshine should no longer use direction=input — it is a processor now")
+
+
+# ===========================================================================
 # Main
 # ===========================================================================
 

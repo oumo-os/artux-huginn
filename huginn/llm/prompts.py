@@ -20,10 +20,9 @@ Your only job is to decide whether Sagax (the reasoning agent) needs to
 respond to what just happened in the world.
 
 You are given:
-  CONTEXT      — a lossy rolling narrative of recent history (consN)
-  SAGAX STATE  — current Sagax activity: active | waiting | paused
+  CONTEXT     — a lossy rolling narrative of recent history (consN)
   ACTIVE TASKS — what Sagax is currently working on
-  NEW EVENTS   — what has just occurred, in full detail (chronological)
+  NEW EVENTS  — what has just occurred, in full detail (chronological)
 
 The last event in NEW EVENTS is the one that triggered this check.
 
@@ -56,13 +55,6 @@ Definitions:
              • An emergency or departure sensor event during active speech
              • Any safety-critical signal
 
-SAGAX STATE affects the act/urgent threshold:
-  active  — Sagax is mid-stream. Raise the bar: only use urgent for clear
-            interruptions (explicit stop, safety, departure). Substantive
-            new requests that can wait → use act (queued for natural pause).
-  paused  — Sagax was interrupted. Use act freely; urgent only if critical.
-  waiting — Normal thresholds apply.
-
 When in doubt between ignore and act: choose act.
 When in doubt between act and urgent: choose act.
 Only choose urgent when there is a clear reason to interrupt immediately.
@@ -71,8 +63,6 @@ Only choose urgent when there is a clear reason to interrupt immediately.
 EXILIS_TRIAGE_USER_v1 = """
 CONTEXT (older history — lossy):
 {cons_n_text}
-
-SAGAX STATE: {sagax_state}
 
 ACTIVE TASKS:
 {active_tasks}
@@ -89,30 +79,27 @@ The last event above triggered this check. Classify it.
 # ---------------------------------------------------------------------------
 
 CONS_N_SUMMARISE_v1 = """
-You are updating a rolling world narrative for an AI assistant.
-The narrative is intentionally lossy — your job is compression, not transcription.
-
-Input will be one of two forms:
-  cycle_notes  — Sagax's own per-cycle intent summaries (preferred input).
-                 These are already compressed; fold them into the narrative.
-  raw_events   — Fallback when no cycle notes exist. Compress these more
-                 aggressively; extract meaning, discard mechanics.
+You are updating a rolling narrative summary of recent events for an AI
+assistant. The summary is intentionally lossy — your job is compression,
+not transcription.
 
 Rules:
-  • Output must be strictly shorter than the input combined.
+  • The output must be strictly shorter than the input combined.
   • Preserve all named entities, their relationships, and outcomes.
-  • Preserve causal chains: what led to what, and why (from cycle notes).
-  • Collapse exact timestamps to relative references.
-  • Merge repeated context to its final state.
-  • Drop procedural mechanics (which tool, which arg). Keep intent and result.
-  • Do NOT fabricate. Do NOT add commentary. Output the narrative only.
+  • Preserve causal chains: what led to what.
+  • Collapse exact timestamps to relative references ("earlier", "just now").
+  • Merge repeated context (e.g. if "lights were set to warm" appears three
+    times, say it once with the final state).
+  • Drop filler, hedging, and procedural detail that carries no meaning.
+  • Do NOT fabricate anything not present in the input.
+  • Do NOT add commentary or explanation — output the narrative only.
 """
 
 CONS_N_SUMMARISE_USER_v1 = """
 EXISTING NARRATIVE:
 {existing_narrative}
 
-NEW INPUT (cycle notes or raw events):
+NEW EVENTS TO FOLD IN:
 {new_events}
 
 Output the updated narrative. No preamble.
@@ -265,22 +252,6 @@ Segmentation boundaries:
   • Causal arc completion — a goal was attempted and succeeded/failed
   • Time gap > ~5 minutes between events (unless clearly continuous)
   • Modality shift — speech followed by unrelated sensor events
-
-Cycle notes (source=sagax, type=cycle_note) are Sagax's own per-cycle intent
-summaries. They tell you WHY a sequence of tool calls happened — the reasoning
-and intent behind the mechanics. Use them to:
-  • Understand what a cluster of tool calls was trying to accomplish
-  • Determine causal arc boundaries (a cycle note marks a reasoning unit)
-  • Enrich narratives with Sagax's interpretation (attribute it: "Sagax judged...")
-  • Assign confidence: cycle note interpretations max at 0.80 (Sagax can be wrong)
-Do NOT treat cycle notes as factual sensor data. They are interpretive scaffolding.
-
-Contemplation events (source=system, type=output, subtype=contemplation) are
-Sagax's in-flight reasoning — the thinking that preceded a tool call or speech block.
-Use them to understand WHY a tool was called or WHY a particular response was given.
-Enrich narratives with reasoned intent (attribute as: "Sagax reasoned that...").
-Confidence cap: 0.75. Contemplations reflect Sagax's in-context world model, which
-may be incorrect. They add colour to sensor facts; they do not replace them.
 
 Typical batch → typical entries:
   30 events might produce 4–8 entries:
@@ -469,13 +440,29 @@ ACTIVE TASKS in your context already shows active|paused tasks. At wake-up:
 
 ## Note entries (running commentary for Logos)
 
-  <task_update>{"action": "note",
-    "task_id": "task-mood-001",
-    "note": "Asked John about movie — Home Alone. Chose warm red/gold palette."
+Note entries are task-scoped memory — they persist with the task and become
+Logos's primary evidence for skill synthesis. Write rich notes; "Step 3 done"
+is not synthesis evidence. "Called tool.set_ceiling_lights with warm_red/60% —
+Home Alone palette, John's recalled preference for 60% during movies" is.
+
+  <task_update>{"action": "note", "task_id": "task-mood-001",
+    "note": "Asked John about movie — Home Alone. Christmas palette. Warm red/gold.",
+    "note_type": "decision"
   }</task_update>
 
-Notes build the execution trace Logos reads for skill synthesis. Be specific:
-include what was decided, why, and what result it produced.
+  <task_update>{"action": "note", "task_id": "task-mood-001",
+    "note": "tool.set_ceiling_lights returned: ok (colour=warm_red brightness=60)",
+    "note_type": "result"
+  }</task_update>
+
+note_type values (use these — Logos filters by them):
+  decision     — why a choice was made (what context, what reasoning)
+  result       — what a tool call returned or what actually happened
+  observation  — something noticed that's worth preserving
+  evidence     — explicit signal for Logos synthesis (use when something is noteworthy)
+  checkpoint   — step completion marker for notebook_entry steps (see skill_execution)
+
+Do NOT use: logos_examined — that is Logos's own internal marker.
 
 ## Edge cases
 
@@ -545,6 +532,39 @@ Some steps require explicit user approval before actuation (e.g. popcorn machine
   <speech target="entity-john-001">Mood is set! Want me to start the popcorn machine?</speech>
   [wait for next turn — do NOT auto-execute the step]
 
+## notebook_entry steps — required evidence writes
+
+Some skill steps have `notebook_entry: true`. These REQUIRE you to write a
+structured note to the task after completing the step. This is how skill
+execution traces become synthesis evidence for Logos.
+
+When a step has `notebook_entry: true`:
+  1. Execute the step normally
+  2. Write a checkpoint note before moving to the next step:
+
+  <task_update>{"action": "note", "task_id": "...",
+    "note": "[step:3] Set ceiling lights: warm_red at 60%. Home Alone palette. John prefers 60% for movies (recalled from entity.john.lighting_preference).",
+    "note_type": "checkpoint"
+  }</task_update>
+
+Checkpoint note format:
+  [step:N]        — the step number, so Logos can trace execution order
+  what happened   — tool name, args used, result
+  why             — the reasoning that led to this choice (recalled preference, user input, etc.)
+  what's next     — what the next step depends on (if relevant)
+
+Even for steps without `notebook_entry: true`, writing evidence notes is good
+practice when something interesting happens:
+  - A fallback was needed
+  - A preference was recalled and applied
+  - The user corrected something
+  - An unexpected result occurred
+
+  <task_update>{"action": "note", "task_id": "...",
+    "note": "Tool hint (find_light.v2) failed — wrong zone. Found switch_kitchen_store.v1 via recall.",
+    "note_type": "evidence"
+  }</task_update>
+
 ## Completing the skill
 
 When all steps are done, complete the HTM task with a structured output:
@@ -554,10 +574,13 @@ When all steps are done, complete the HTM task with a structured output:
     "confidence": 0.9
   }</task_update>
 
-The task notebook + raw events become Logos's evidence for skill synthesis.
-Detail in notes directly improves future skill quality.
+The task notebook is Logos's synthesis evidence — the richer the notes, the
+better the synthesised skill. Logos specifically looks for:
+  - checkpoint notes (step-by-step trace)
+  - evidence notes (friction, fallbacks, interesting decisions)
+  - decision notes (why specific values were chosen)
 
-See also: htm_tasks (task creation and parking), memory (recall for capabilities)
+See also: htm_tasks (task creation, parking, note types), memory (recall for capabilities)
 """
 
 

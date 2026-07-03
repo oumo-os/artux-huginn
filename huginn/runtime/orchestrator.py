@@ -13,9 +13,9 @@ No cognitive logic lives here. The Orchestrator:
   - Writes workbook entries on every block close
 
 Token stream state machine (Orchestrator.md §3):
-  IDLE → CAPTURING_THINKING | CAPTURING_CONTEMPLATION | CAPTURING_CYCLE_NOTE
-       | STREAMING_SPEECH | BUFFERING_TOOL_CALL | BUFFERING_AUG_CALL
-       | BUFFERING_TASK_UPDATE | BUFFERING_PROJECTION
+  IDLE → CAPTURING_THINKING | CAPTURING_CONTEMPLATION | STREAMING_SPEECH
+       | BUFFERING_TOOL_CALL | BUFFERING_AUG_CALL | BUFFERING_TASK_UPDATE
+       | BUFFERING_PROJECTION
 
 This file wires together all Huginn components. Instantiate Orchestrator
 last, passing in all other components.
@@ -81,12 +81,11 @@ class NarratorState:
     BUFFERING_TASK_UPDATE   = "BUFFERING_TASK_UPDATE"
     BUFFERING_PROJECTION    = "BUFFERING_PROJECTION"
     STREAMING_SPEECH_STEP   = "STREAMING_SPEECH_STEP"   # speech_step: streaming + waiting for user
-    CAPTURING_CYCLE_NOTE    = "CAPTURING_CYCLE_NOTE"     # per-cycle Sagax summary
 
 
 # Block open/close patterns
-_BLOCK_OPEN  = re.compile(r"<(thinking|think|contemplation|cycle_note|speech|speech_step|tool_call|aug_call|task_update|projection)(\s[^>]*)?>")
-_BLOCK_CLOSE = re.compile(r"</(thinking|think|contemplation|cycle_note|speech|speech_step|tool_call|aug_call|task_update|projection)>")
+_BLOCK_OPEN  = re.compile(r"<(thinking|think|contemplation|speech|speech_step|tool_call|aug_call|task_update|projection)(\s[^>]*)?>") 
+_BLOCK_CLOSE = re.compile(r"</(thinking|think|contemplation|speech|speech_step|tool_call|aug_call|task_update|projection)>")
 _TARGET_ATTR = re.compile(r'target="([^"]+)"')
 _TIMEOUT_ATTR = re.compile(r'timeout_ms="(\d+)"')
 _VAR_ATTR    = re.compile(r'var="([^"]+)"')
@@ -191,6 +190,10 @@ class Orchestrator:
         self.exilis.start()
         self.sagax.start()
         self.logos.start()
+        # Start capture→process fan-out (new perception architecture)
+        if hasattr(self.perception, "start_capture_fanout"):
+            self.perception.start_capture_fanout(self.tool_manager)
+
         # Start any HTM-registered live actuation tools
         if self.actuation_manager is not None:
             self.actuation_manager.start_from_htm(self.tool_manager)
@@ -458,12 +461,8 @@ class Orchestrator:
             confirmation_required = confirmation_required or [],
         )
         self.htm.new_session(sid)
-        self.sagax.entity_id           = entity_id
-        self.sagax.permission_scope     = permission_scope
-        self.sagax._current_session_id  = sid
-        # Clear any session task from the previous session so Sagax
-        # creates a fresh one on its first cycle.
-        self.sagax.invalidate_session_task()
+        self.sagax.entity_id       = entity_id
+        self.sagax.permission_scope = permission_scope
         return sid
 
     def end_session(self):
@@ -481,6 +480,7 @@ class Orchestrator:
 
     def _on_exilis_act(self):
         """Queue a normal Sagax wake."""
+        self._set_sagax_state("thinking")
         self.sagax.wake()
 
     def _on_exilis_urgent(self, event: STMEvent):
@@ -540,10 +540,6 @@ class Orchestrator:
 
         self._narrator_state = NarratorState.IDLE
 
-        # Mark session task paused so the next triage cycle knows
-        # Sagax was interrupted rather than having finished cleanly.
-        self.sagax._update_session_task_state("paused")
-
         # Stage 2: deliver context and wake Sagax with priority
         self.sagax.wake(signal=type("WakeSignal", (), {
             "priority": "urgent", "event": event
@@ -588,12 +584,35 @@ class Orchestrator:
                 self.on_tts_token(token)    # raw token stream for legacy callers
             self._feed_speech_chunk(token)  # chunk-level bus publish
 
+    # ------------------------------------------------------------------
+    # Cognitive state tracking via HTM.states
+    # ------------------------------------------------------------------
+
+    # Maps NarratorState → sagax.state value written to HTM.states.
+    # The avatar, Exilis, and any other observer reads sagax.state from
+    # HTM.states to know what Sagax is currently doing.
+    _SAGAX_STATE_MAP = {
+        "CAPTURING_THINKING":      None,          # transient — don't announce
+        "CAPTURING_CONTEMPLATION": "contemplating",
+        "STREAMING_SPEECH":        "speaking",
+        "STREAMING_SPEECH_STEP":   "speaking",
+        "BUFFERING_TOOL_CALL":     "tool_wait",
+        "BUFFERING_AUG_CALL":      "aug_wait",
+        "BUFFERING_TASK_UPDATE":   "thinking",    # brief state write — stays thinking
+        "BUFFERING_PROJECTION":    "thinking",
+        "IDLE":                    None,          # caller sets sleep/thinking explicitly
+    }
+
+    def _set_sagax_state(self, state: str) -> None:
+        """Write sagax.state to HTM.states. No-op if unchanged."""
+        if self.htm.states.get("sagax.state") != state:
+            self.htm.states.set("sagax.state", state, mark_dirty=False)
+
     def _on_block_open(self, tag: str, attrs: str):
         state_map = {
             "thinking":       NarratorState.CAPTURING_THINKING,
             "think":          NarratorState.CAPTURING_THINKING,   # model alias
             "contemplation":  NarratorState.CAPTURING_CONTEMPLATION,
-            "cycle_note":     NarratorState.CAPTURING_CYCLE_NOTE,
             "speech":         NarratorState.STREAMING_SPEECH,
             "speech_step":    NarratorState.STREAMING_SPEECH_STEP,
             "tool_call":      NarratorState.BUFFERING_TOOL_CALL,
@@ -602,6 +621,11 @@ class Orchestrator:
             "projection":     NarratorState.BUFFERING_PROJECTION,
         }
         self._narrator_state = state_map.get(tag, NarratorState.IDLE)
+
+        # Announce cognitive state to HTM.states for avatar and observers
+        sagax_state = self._SAGAX_STATE_MAP.get(self._narrator_state)
+        if sagax_state:
+            self._set_sagax_state(sagax_state)
 
         if tag in ("speech", "speech_step"):
             m = _TARGET_ATTR.search(attrs)
@@ -633,23 +657,6 @@ class Orchestrator:
             )
             self.htm.asc.workbook_write("contemplation", content.strip())
 
-        elif tag == "cycle_note":
-            # Sagax's per-cycle intent summary. Written to STM only.
-            # NOT written to the workbook (that's the skill-gap trace).
-            # NOT published to ActuationBus. NOT sent to TTS.
-            # Consumed by: Sagax._update_cons_n (replaces raw-event compression)
-            #              Logos consolidation (intentional arc context)
-            text = content.strip()
-            if text:
-                self.stm.record(
-                    source="sagax", type="cycle_note",
-                    payload={
-                        "text":       text,
-                        "session_id": self.session.session_id,
-                        "entity_id":  self.session.entity_id,
-                    },
-                )
-
         elif tag == "speech":
             self._publish_speech_full(content.strip(), self._speech_target)
             self.stm.record(
@@ -675,6 +682,9 @@ class Orchestrator:
             self._handle_projection(content)
 
         self._narrator_state = NarratorState.IDLE
+        # After any block closes, Sagax returns to thinking (another block may follow)
+        # The actual sleep state is set when the full cycle ends (see Sagax._cycle)
+        self._set_sagax_state("thinking")
 
     # ------------------------------------------------------------------
     # <tool_call> dispatch
@@ -807,6 +817,14 @@ class Orchestrator:
                 remind_at    = update.get("remind_at"),
                 expiry_at    = update.get("expiry_at"),
             )
+        elif action == "note" and task_id:
+            # Explicit note write — Sagax uses this for checkpoint, evidence, etc.
+            self.htm.note(
+                task_id,
+                entry     = update.get("note", update.get("entry", "")),
+                note_type = update.get("note_type", "note"),
+            )
+
         elif action == "update" and task_id:
             self.htm.update(
                 task_id,

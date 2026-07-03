@@ -239,6 +239,46 @@ ollama pull llama3.2
 # Or set ANTHROPIC_API_KEY for Anthropic fallback
 ```
 
+### Which models? — pick a computation profile
+
+Huginn assigns a different model size per agent role (Exilis needs speed
+and structured-output precision, Sagax needs reasoning, Logos needs depth
+— see `CognitiveModule.md §4.3` for the full rationale). There is no
+universal recommendation, and this table will age — verify current
+benchmarks before deploying. Pick the profile matching your hardware and
+drop GGUF files into `models/` using the `exilis_*` / `sagax_*` / `logos_*`
+naming convention (auto-detected at boot).
+
+| Profile | Hardware | Exilis | Sagax | Logos |
+|---|---|---|---|---|
+| **micro** | Raspberry Pi, SBC (4–8 GB RAM) | LFM2.5-230M | LFM2.5-1.2B-Instruct | shared with Sagax |
+| **standard** | Mini PC, laptop (8–16 GB RAM) | LFM2.5-230M | LFM2.5-8B-A1B (1.5B active) | Gemma4 12B |
+| **workstation** | Desktop + GPU (16–32 GB) | Qwen3.5-0.8B | Gemma4 26B (3.8B active) | Qwen3.6-35B-A3B |
+| **server** | Dedicated box + GPU(s) (32 GB+) | Qwen3.5-0.8B | Qwen3.6-35B-A3B | Larger local MoE or API |
+
+LFM2.5-230M is purpose-trained for structured extraction and tool-call
+classification — exactly Exilis's job — and beats larger general models
+on those specific benchmarks while running under 375 MB. It defaults to
+Pythonic tool-call syntax rather than JSON; add a system-prompt
+instruction requesting JSON output if using it as a provider for
+`complete_tools`.
+
+```bash
+# Example: standard profile
+mkdir -p models
+# Download or symlink your chosen GGUF files with role prefixes:
+#   models/exilis_lfm2.5-230m.gguf
+#   models/sagax_lfm2.5-8b-a1b.gguf
+#   models/logos_gemma4-12b.gguf
+pip install llama-cpp-python
+```
+
+On `micro` profiles, consider raising `logos_interval_s` (600–900s) so
+Logos doesn't compete with Sagax for limited CPU cores. On `server`
+profiles, Logos can be pointed at a hosted API provider instead of a
+local GGUF — see `CognitiveModule.md §4.3` for the hybrid deployment
+pattern and a license note before committing to any model for commercial use.
+
 ---
 
 ## Quick Start
@@ -376,9 +416,18 @@ huginn/
                                     8x INSTRUCTION_*_v1 artifact constants
 
 tools/
+├── builtin/                      Ships with Huginn — auto-installed, no staging
+│   ├── tool_llm_llamacpp.py      GGUF provider, per-role model paths
+│   ├── tool_capture_microphone.py  Mic capture only (direction: capture)
+│   ├── tool_capture_camera.py    Camera capture only (direction: capture)
+│   ├── tool_asr_moonshine.py     Speech-to-text (direction: process)
+│   ├── tool_tts_kokoro.py        Kokoro TTS daemon (direction: output)
+│   └── tool_ui_text.py           Terminal I/O
 └── staging/                      Drop new .py tool files here
     ├── tool_llm_ollama.py        Ollama LLM provider (mode: provider)
     ├── tool_llm_anthropic.py     Anthropic Claude provider (mode: provider)
+    ├── tool_identity_voice.py    Speaker ID via ECAPA (direction: process)
+    ├── tool_identity_face.py     Face ID via InsightFace (direction: process)
     ├── tool_config_write.py      Write LTM config entries (Sagax-callable)
     └── ...                       Other starter tools
 

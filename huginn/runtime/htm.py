@@ -61,8 +61,24 @@ class Task:
     def from_json(cls, s: str) -> "Task":
         return cls(**json.loads(s))
 
-    def add_note(self, entry: str):
-        self.notebook.append({"ts": _utcnow(), "entry": entry})
+    def add_note(self, entry: str, note_type: str = "note"):
+        """
+        Append a structured note to this task's notebook.
+
+        note_type values:
+          note         — general observation (default)
+          decision     — why a particular choice was made
+          result       — what a tool call returned
+          observation  — something noticed during execution
+          evidence     — synthesis candidate signal for Logos
+          checkpoint   — step completion marker (used with notebook_entry steps)
+          logos_examined — Logos's own processing marker (do not write this yourself)
+        """
+        self.notebook.append({
+            "ts":    _utcnow(),
+            "type":  note_type,
+            "entry": entry,
+        })
         self.updated_at = _utcnow()
 
 
@@ -439,20 +455,44 @@ class HTMStates:
 
     def summary(self, max_keys: int = 30) -> str:
         """
-        One-line summary for Sagax context injection.
-        Groups by namespace prefix.
+        Structured snapshot for Sagax context injection.
+
+        Cognitive states (sagax.state, logos.state) always appear first
+        so they are visible even if the snapshot is truncated.
+        Groups remaining keys by namespace.
         """
         if not self._store:
             return "(no states)"
+
+        lines = []
+
+        # Always show cognitive states first
+        for key in ("sagax.state", "logos.state"):
+            val = self._store.get(key)
+            if val is not None:
+                lines.append(f"  {key} = {val!r}")
+
+        # Group remaining keys by namespace
         groups: dict[str, list[str]] = {}
+        skip = {"sagax.state", "logos.state"}
         for k, v in sorted(self._store.items()):
+            if k in skip:
+                continue
             ns = k.split(".")[0] if "." in k else "global"
             groups.setdefault(ns, []).append(f"{k}={v!r}")
-        lines = []
+
+        count = len(lines)
         for ns, entries in groups.items():
-            lines.append("  " + " | ".join(entries))
-        result = "\n".join(lines)
-        return result
+            if count >= max_keys:
+                lines.append(f"  ... ({len(self._store) - count} more keys)")
+                break
+            line = "  " + " | ".join(entries[:6])
+            if len(entries) > 6:
+                line += f" ... (+{len(entries)-6})"
+            lines.append(line)
+            count += len(entries)
+
+        return "\n".join(lines)
 
     # ----------------------------------------------------------------
     # Bulk load (called by Orchestrator._apply_system_config)
@@ -587,10 +627,10 @@ class HTM:
         self._save(task)
         return task.task_id
 
-    def note(self, task_id: str, entry: str) -> bool:
+    def note(self, task_id: str, entry: str, note_type: str = "note") -> bool:
         tasks = self._load(task_id=task_id)
         if not tasks: return False
-        tasks[0].add_note(entry)
+        tasks[0].add_note(entry, note_type=note_type)
         self._save(tasks[0])
         return True
 
@@ -652,6 +692,26 @@ class HTM:
     # ------------------------------------------------------------------
     # Scheduler tick (called by Orchestrator at ~1 Hz)
     # ------------------------------------------------------------------
+
+    def notebook_entries(
+        self,
+        task_id:   str,
+        note_type: str = "",
+        limit:     int = 50,
+    ) -> list[dict]:
+        """
+        Return notebook entries for a task, optionally filtered by type.
+
+        Used by Logos when scanning for synthesis evidence — it queries
+        note_type="evidence" rather than scanning all notes for a marker string.
+        """
+        tasks = self._load(task_id=task_id)
+        if not tasks:
+            return []
+        entries = tasks[0].notebook
+        if note_type:
+            entries = [n for n in entries if n.get("type") == note_type]
+        return entries[-limit:]
 
     def scheduler_tick(self) -> list[tuple[str, str]]:
         """Advance task states. Returns list of (task_id, new_state) changes."""

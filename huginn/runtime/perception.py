@@ -39,6 +39,32 @@ from .htm import HTM, HotEntity
 # Tool handler registry
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# CaptureFrame — data unit flowing from capture tools to processor tools
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CaptureFrame:
+    """
+    A single unit of raw sensor data produced by a capture tool and
+    dispatched by PerceptionManager to all matching processor tools.
+
+    kind    — "audio_chunk" | "video_frame" | "screen_frame" | "text_input"
+    data    — the raw payload (numpy array, bytes, str — tool-defined)
+    ts      — ISO timestamp of capture
+    meta    — device metadata: sample_rate, resolution, device_id, etc.
+    """
+    kind:  str
+    data:  Any
+    ts:    str   = ""
+    meta:  dict  = field(default_factory=dict)
+
+    def __post_init__(self):
+        if not self.ts:
+            from datetime import datetime, timezone
+            self.ts = datetime.now(timezone.utc).isoformat()
+
+
 class ToolRegistry:
     """
     Maps tool_id → Python callable.
@@ -130,6 +156,149 @@ class PerceptionManager:
         self.session          = session
         self.on_event_written = on_event_written
         self.sig_threshold    = sig_threshold
+
+    # ------------------------------------------------------------------
+    # Fan-out dispatcher — new perception architecture
+    # ------------------------------------------------------------------
+    # Capture tools (direction: capture) produce CaptureFrame objects.
+    # PerceptionManager owns the dispatch loops and fans each frame out
+    # to all processor tools (direction: process) that consume that kind.
+    # This replaces the step-based pipeline model for sensor tools.
+    # ------------------------------------------------------------------
+
+    def start_capture_fanout(self, tool_manager) -> int:
+        """
+        Start a dispatch thread for each active capture tool.
+        Call this from Orchestrator.start() after tools are loaded.
+
+        Returns the number of capture tools started.
+        """
+        self._tool_manager   = tool_manager
+        self._fanout:  dict  = {}           # kind → [push_fn]
+        self._capture_threads: list = []
+        self._fanout_running = True
+
+        # Build processor fan-out map
+        for desc in tool_manager.world_descriptors():
+            if desc.direction == "process" and desc.consumes:
+                push_fn = self._make_push_fn(desc, tool_manager)
+                if push_fn:
+                    for kind in desc.consumes:
+                        self._fanout.setdefault(kind, []).append(push_fn)
+
+        # Start dispatch threads for capture tools
+        started = 0
+        for desc in tool_manager.world_descriptors():
+            if desc.direction != "capture" or not desc.source_path:
+                continue
+            if not desc.emits:
+                continue
+            try:
+                import importlib.util
+                spec   = importlib.util.spec_from_file_location(
+                    desc.tool_id, desc.source_path
+                )
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+
+                if hasattr(module, "get_queue"):
+                    q = module.get_queue()
+                    t = threading.Thread(
+                        target   = self._dispatch_loop,
+                        args     = (q,),
+                        daemon   = True,
+                        name     = f"PM-{desc.tool_id}",
+                    )
+                    t.start()
+                    self._capture_threads.append(t)
+                    started += 1
+            except Exception as e:
+                self.stm.record(
+                    source="system", type="internal",
+                    payload={"subtype": "capture_start_error",
+                             "tool_id": desc.tool_id, "error": str(e)},
+                )
+
+        return started
+
+    def stop_capture_fanout(self) -> None:
+        self._fanout_running = False
+
+    def _dispatch_loop(self, capture_queue) -> None:
+        """
+        Drain a capture tool's queue and fan each CaptureFrame out
+        to all registered processor tools.
+        Non-blocking: processor failures never stall the capture loop.
+        """
+        import queue as _queue
+        while getattr(self, "_fanout_running", True):
+            try:
+                frame = capture_queue.get(timeout=0.5)
+            except _queue.Empty:
+                continue
+            if frame is None:  # stop sentinel
+                break
+            for push_fn in self._fanout.get(frame.kind, []):
+                try:
+                    push_fn(frame)
+                except Exception as e:
+                    self.stm.record(
+                        source="system", type="internal",
+                        payload={"subtype": "processor_dispatch_error",
+                                 "error": str(e)},
+                    )
+
+    def _make_push_fn(self, descriptor, tool_manager) -> Optional[Callable]:
+        """
+        Build a push_fn for a processor tool.
+        The fn calls module.push(frame) with _stm and _htm pre-bound.
+        Returns None if the module cannot be loaded.
+        """
+        source_path = descriptor.source_path
+        if not source_path:
+            return None
+        try:
+            import importlib.util, inspect
+            spec   = importlib.util.spec_from_file_location(
+                descriptor.tool_id, source_path
+            )
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+
+            push = getattr(module, "push", None)
+            if push is None:
+                return None
+
+            # Inject _stm and _htm if the push fn declares them
+            sig = inspect.signature(push)
+            stm_ref = self.stm
+            htm_ref = self.htm
+
+            def _push_fn(frame: CaptureFrame,
+                         _push=push, _sig=sig,
+                         _stm=stm_ref, _htm=htm_ref) -> None:
+                kw = {"frame": frame}
+                if "_stm" in _sig.parameters: kw["_stm"] = _stm
+                if "_htm" in _sig.parameters: kw["_htm"] = _htm
+                _push(**kw)
+
+            return _push_fn
+        except Exception:
+            return None
+
+    def fan_frame(self, frame: CaptureFrame) -> int:
+        """
+        Manually fan out a CaptureFrame (e.g. from a legacy input tool).
+        Returns the number of processors that received it.
+        """
+        count = 0
+        for push_fn in getattr(self, "_fanout", {}).get(frame.kind, []):
+            try:
+                push_fn(frame)
+                count += 1
+            except Exception:
+                pass
+        return count
 
     # ------------------------------------------------------------------
     # Primary entry point — called from Orchestrator tick
