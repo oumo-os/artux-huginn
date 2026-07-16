@@ -463,6 +463,8 @@ class Orchestrator:
         self.htm.new_session(sid)
         self.sagax.entity_id       = entity_id
         self.sagax.permission_scope = permission_scope
+        self.sagax._current_session_id = sid
+        self.sagax.invalidate_session_task()
         return sid
 
     def end_session(self):

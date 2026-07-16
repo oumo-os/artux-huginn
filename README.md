@@ -39,6 +39,8 @@ World → Perception Manager → STM (Muninn) → Exilis → Sagax → Orchestra
 
 ## How It Feels
 
+#
+
 ### Interruption without losing your place
 
 John asks for movie mood lighting. Sagax recalls `skill.set_movie_mood`,

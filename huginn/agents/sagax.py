@@ -169,6 +169,9 @@ class Sagax:
         self._executor = _cf.ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="SagaxConsN"
         )
+        # Guards the stm._summarise swap/restore so overlapping async
+        # consN jobs cannot clobber each other's summariser.
+        self._consn_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -521,16 +524,18 @@ class Sagax:
         else:
             # No cycle notes — fall back to raw event compression
             window     = self.stm.get_stm_window()
-            raw_events = window.get("new_events", [])
+            raw_events = _denoise_events(window.get("new_events", []))
             if not raw_events:
                 return
             new_events_text = "\n".join(
                 f"[{e.ts}] {e.source}/{e.type}: "
                 + (e.payload.get("text") or e.payload.get("description")
                    or json.dumps(e.payload)[:100])
+                + (f"  (x{e.payload['_denoised_count']} over {e.payload.get('_denoised_span_s',0)}s)"
+                   if e.payload.get("_denoised_count") else "")
                 for e in raw_events
             )
-            source_label = f"raw_events ({len(raw_events)} events)"
+            source_label = f"raw_events ({len(raw_events)} events, denoised)"
 
         user_prompt = CONS_N_SUMMARISE_USER_v1.format(
             existing_narrative = existing or "(none yet)",
@@ -545,10 +550,13 @@ class Sagax:
             )
             new_text = resp.text.strip()
 
-            original_fn = self.stm._summarise
-            self.stm._summarise = lambda _existing, _events: new_text
-            new_cons = self.stm.update_cons_n(force=True)
-            self.stm._summarise = original_fn
+            with self._consn_lock:
+                original_fn = self.stm._summarise
+                try:
+                    self.stm._summarise = lambda _existing, _events: new_text
+                    new_cons = self.stm.update_cons_n(force=True)
+                finally:
+                    self.stm._summarise = original_fn
 
             if new_cons is not None and self._orchestrator is not None:
                 try:
@@ -918,12 +926,14 @@ class Sagax:
         )
 
         user_prompt = SAGAX_PLAN_USER_v1.format(
-            stm_context      = _format_stm_context(context),
+            cons_n_snippet   = _format_cons_n_snippet(context, self.max_context_tokens // 3),
+            recent_events    = _denoise_events(context.get("new_events", [])),
             active_tasks     = _format_tasks(active_tasks),
             state_snapshot   = self.htm.states.summary(),
             staging_tools    = _format_staging_tasks(staging_tasks),
             entity_id        = self.entity_id or "unknown",
             permission_scope = ", ".join(self.permission_scope) or "none",
+            injected_instruction = "",
         )
 
         # chat() is a single-turn call — use a local list, not self._messages,
@@ -1045,12 +1055,72 @@ def _format_cons_n_snippet(context: dict, max_chars: int = 400) -> str:
     return text or "(none yet)"
 
 
+def _denoise_events(events: list, window_s: float = 30.0) -> list:
+    """
+    Collapse runs of near-identical events into a single representative
+    entry with a count and duration, before they reach context or consN.
+
+    Why this matters: ambient sensor tools (motion, audio events) can fire
+    many similar events in a short window. Without denoising, a 6-event
+    context budget can be entirely consumed by 6 duplicate "motion_detected"
+    entries, leaving no room for the one event that actually matters.
+
+    Two events are considered duplicates if they share source, type, and
+    subtype/label, and fall within window_s of each other. The collapsed
+    entry keeps the most recent payload and timestamp, with a count and
+    span noted.
+
+    This does not touch STM — events remain in full fidelity there.
+    Denoising is applied only to the *view* of events handed to context
+    builders and the consN fallback compression path.
+    """
+    if not events:
+        return events
+
+    def _key(e):
+        subtype = e.payload.get("subtype") or e.payload.get("label") or ""
+        return (e.source, e.type, subtype)
+
+    def _ts(e):
+        try:
+            from datetime import datetime
+            return datetime.fromisoformat(e.ts.replace("Z", "+00:00")).timestamp()
+        except Exception:
+            return 0.0
+
+    collapsed = []
+    run_start = None
+    run_count = 0
+
+    for e in events:
+        if collapsed and _key(collapsed[-1]) == _key(e) and \
+           (_ts(e) - _ts(collapsed[-1])) <= window_s:
+            # Extend the current run — replace with the newer event,
+            # but remember how many were folded in.
+            run_count += 1
+            # Copy the event so the live STMEvent (shared via get_stm_window)
+            # is never mutated — events[] is ground truth and must stay intact.
+            merged = STMEvent(
+                id=e.id, ts=e.ts, source=e.source, type=e.type,
+                payload=dict(e.payload), confidence=e.confidence,
+            )
+            merged.payload["_denoised_count"] = run_count + 1
+            merged.payload["_denoised_span_s"] = round(_ts(e) - run_start, 1) if run_start else 0.0
+            collapsed[-1] = merged
+        else:
+            collapsed.append(e)
+            run_start = _ts(e)
+            run_count = 0
+
+    return collapsed
+
+
 def _format_recent_events(context: dict, max_events: int = 6) -> str:
     """
     Last N events, compact single-line format for mode-routing user prompts.
     Tighter than _format_stm_context — no full JSON payloads.
     """
-    new_events = context.get("new_events", [])
+    new_events = _denoise_events(context.get("new_events", []))
     selected   = new_events[-max_events:]
     if not selected:
         return "(none)"

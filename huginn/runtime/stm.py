@@ -431,6 +431,10 @@ class STMStore:
         anchor = self._index_of(self._cons_n.last_event_id)
         return max(0, len(self._events) - (anchor + 1))
 
+    def event_count_since_cons_n(self) -> int:
+        """Alias used by Sagax's cycle-note consN path."""
+        return self.event_count_after_cons_n()
+
     def should_update_cons_n(self) -> bool:
         return self.event_count_after_cons_n() >= CONS_N_MAX_NEW
 

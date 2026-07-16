@@ -64,7 +64,6 @@ def handle(
     Returns structured events and a speech-ready summary.
     """
     from icalendar import Calendar
-    import pytz
 
     sources = _resolve_sources(source)
     if not sources:
@@ -155,7 +154,6 @@ def _extract_events(
     cal, now, end_dt, include_past, events, seen_uid, source_label
 ):
     from icalendar import Event as ICalEvent
-    import pytz
 
     for component in cal.walk():
         if component.name != "VEVENT":

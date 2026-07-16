@@ -99,7 +99,7 @@ _model_path: str = ""
 _model_params: dict = {}
 
 
-def _get_model(htm=None) -> Any:
+def _get_model(htm=None, kw=None) -> Any:
     """
     Lazy-load (or reload) the llama.cpp model.
     Reloads when model_path or key params have changed.
@@ -117,7 +117,7 @@ def _get_model(htm=None) -> Any:
     n_gpu     = 0
     n_threads = 0
     if htm is not None:
-        role      = kw.get("_role", "")
+        role      = (kw or {}).get("_role", "")
         role_key  = f"tool.llm.llamacpp.v1.model_path.{role}" if role else ""
         mp = (
             (htm.states.get(role_key) if role_key else None)
@@ -211,7 +211,7 @@ def complete(
     **kw,
 ):
     from huginn.llm.client import LLMResponse
-    m      = _get_model(kw.get("_htm"))
+    m      = _get_model(kw.get("_htm"), kw)
     temp   = float(_resolve(kw, "temperature", temperature))
     maxtok = int(_resolve(kw, "max_tokens", 2048))
     prompt = _build_prompt(system, messages)
@@ -235,7 +235,7 @@ def stream(
     **kw,
 ) -> Iterator:
     from huginn.llm.client import StreamChunk
-    m      = _get_model(kw.get("_htm"))
+    m      = _get_model(kw.get("_htm"), kw)
     temp   = float(_resolve(kw, "temperature", temperature))
     maxtok = int(_resolve(kw, "max_tokens", 2048))
     prompt = _build_prompt(system, messages)
@@ -260,7 +260,7 @@ def complete_json(
     JSON-constrained completion using llama.cpp grammar mode.
     Falls back to prompt-based extraction if grammar fails.
     """
-    m         = _get_model(kw.get("_htm"))
+    m         = _get_model(kw.get("_htm"), kw)
     maxtok    = int(_resolve(kw, "max_tokens", 1024))
     schema_h  = json.dumps(schema, indent=2)
     full_sys  = (
@@ -327,7 +327,7 @@ def complete_tools(
         LLMResponse, _tool_schema_summary, _FALLBACK_SUFFIX,
         _extract_json_tool_calls,
     )
-    m      = _get_model(kw.get("_htm"))
+    m      = _get_model(kw.get("_htm"), kw)
     temp   = float(_resolve(kw, "temperature", temperature))
     maxtok = int(_resolve(kw, "max_tokens", 2048))
     t0     = time.monotonic()
