@@ -191,17 +191,7 @@ class Exilis:
         context      = self.stm.get_stm_window()
         active_tasks = self.htm.query(state="active|paused", initiated_by="sagax")
 
-        # Derive Sagax foreground state from its session task.
-        # 'active'  — Sagax is mid-stream right now → raise urgent bar
-        # 'paused'  — interrupted mid-cycle → act is fine, urgent only if critical
-        # 'waiting' — between cycles → normal triage thresholds apply
-        sagax_state = "waiting"
-        for t in active_tasks:
-            if "sagax_session" in (t.tags or []):
-                sagax_state = t.state
-                break
-
-        signal = self._triage(context, active_tasks, new_events, sagax_state)
+        signal = self._triage(context, active_tasks, new_events)
         if signal is None:
             return
 
@@ -220,7 +210,6 @@ class Exilis:
         context:      dict,
         active_tasks: list,
         new_events:   list,
-        sagax_state:  str  = "waiting",
     ) -> TriageSignal:
         """
         One LLM call. Returns a TriageSignal.
@@ -230,7 +219,6 @@ class Exilis:
             cons_n_text   = context.get("cons_n_text") or "No prior context (cold start).",
             active_tasks  = _format_tasks(active_tasks),
             new_events    = _format_events(new_events),
-            sagax_state   = sagax_state,
         )
 
         try:
@@ -269,12 +257,7 @@ class Exilis:
         self._last_processed_id = new_events[-1].id
         context      = self.stm.get_stm_window()
         active_tasks = self.htm.query(state="active|paused", initiated_by="sagax")
-        sagax_state  = "waiting"
-        for t in active_tasks:
-            if "sagax_session" in (t.tags or []):
-                sagax_state = t.state
-                break
-        return self._triage(context, active_tasks, new_events, sagax_state)
+        return self._triage(context, active_tasks, new_events)
 
 
 # ---------------------------------------------------------------------------

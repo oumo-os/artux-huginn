@@ -696,6 +696,8 @@ class Logos:
             "tools_installed": 0,
         }
 
+        self.htm.states.set("logos.state", "consolidating", mark_dirty=False)
+
         # On first ever pass: ensure startup procedure and system config exist in LTM
         if self._first_pass:
             self._first_pass = False
@@ -706,6 +708,8 @@ class Logos:
 
         # Always scan staging dir — even when no STM events to consolidate
         self._staging_scan_pass()
+        if self.htm.query(tags_any=["tool_staging"], state="waiting"):
+            self.htm.states.set("logos.state", "installing", mark_dirty=False)
         counts["tools_installed"] = self._staging_install_pass()
 
         watermark = self.stm.get_logos_watermark()
@@ -714,6 +718,7 @@ class Logos:
         )
 
         if not raw_batch:
+            self.htm.states.set("logos.state", "sleep", mark_dirty=False)
             self._emit_health(pass_id, started, counts, stm_flushed=0)
             return
 
@@ -771,10 +776,12 @@ class Logos:
                          "error": str(e)},
             )
             # Do NOT flush — batch stays until next pass
+            self.htm.states.set("logos.state", "sleep", mark_dirty=False)
             self._emit_health(pass_id, started, counts, stm_flushed=0)
             return
 
         # -- Step 2: skill synthesis — observe patterns, manage evaluation tasks
+        self.htm.states.set("logos.state", "synthesising", mark_dirty=False)
         try:
             synth_count = self._skill_synthesis_scan(raw_batch)
             counts["skills"] += synth_count
@@ -797,6 +804,7 @@ class Logos:
                 self.htm.mark_consolidated(task.task_id)
 
         # -- Step 6: health event
+        self.htm.states.set("logos.state", "sleep", mark_dirty=False)
         self._emit_health(pass_id, started, counts, stm_flushed=flushed)
 
     # ------------------------------------------------------------------
@@ -981,12 +989,12 @@ class Logos:
                 # Append new evidence to the existing evaluation task
                 task = existing[0]
                 entry = (
-                    f"[evidence] New execution pattern observed: {pattern}. "
+                    f"New execution pattern: {pattern}. "
                     f"Friction: {c.get('friction', 'unknown')}. "
                     f"Opportunity: {c.get('opportunity', '')}. "
                     f"Evidence tasks: {c.get('evidence_task_ids', [])}"
                 )
-                self.htm.note(task.task_id, entry)
+                self.htm.note(task.task_id, entry, note_type="evidence")
             else:
                 # Create a new evaluation task for this synthesis candidate
                 task_id = self.htm.create(
@@ -997,8 +1005,8 @@ class Logos:
                     progress    = f"Pattern identified: {pattern[:100]}",
                 )
                 self.htm.note(task_id,
-                    f"[created] Initial observation: {pattern}. "
-                    f"Opportunity: {c.get('opportunity', '')}."
+                    f"Initial observation: {pattern}. Opportunity: {c.get('opportunity', '')}.",
+                    note_type="observation",
                 )
                 self.stm.record(
                     source="system", type="internal",
@@ -1011,9 +1019,9 @@ class Logos:
                 )
                 created += 1
 
-        # Mark examined tasks so they don't recur
+        # Mark examined tasks so they don't recur (typed marker)
         for t in persist_tasks[:10]:
-            self.htm.note(t.task_id, "[logos_examined]")
+            self.htm.note(t.task_id, "[logos_examined]", note_type="logos_examined")
 
         return created
 
@@ -1035,7 +1043,7 @@ class Logos:
             # Count evidence entries in notebook
             evidence_entries = [
                 n for n in task.notebook
-                if "[evidence]" in n.get("entry", "")
+                if n.get("type") == "evidence" or "[evidence]" in n.get("entry", "")
             ]
             # Count sessions spanned
             sessions = len({

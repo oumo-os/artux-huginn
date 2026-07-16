@@ -82,9 +82,11 @@ class ToolDescriptor:
     source_path:         str = ""               # absolute path to .py file (staged tools)
     handler:             Optional[Callable] = field(default=None, repr=False)
     # Service tool fields (populated from manifest)
-    mode:                str = "callable"        # "callable" | "service"
-    direction:           str = ""               # "input" | "output" | "io" | ""
+    mode:                str = "callable"        # "callable" | "service" | "provider"
+    direction:           str = ""               # "capture" | "process" | "input" | "output" | "io" | ""
     subscriptions:       list = field(default_factory=list)
+    emits:               list = field(default_factory=list)    # capture tools
+    consumes:            list = field(default_factory=list)    # process tools
 
     def to_openai_schema(self) -> dict:
         return {
@@ -215,6 +217,10 @@ class ToolManager:
         descriptor.tier    = "world"
         self._world[tool_id]         = descriptor
         self._schema_cache[tool_id]  = descriptor
+
+    def world_descriptors(self) -> list:
+        """Return all installed world-tier ToolDescriptors."""
+        return list(self._world.values())
 
     def get_descriptor(self, tool_id: str) -> Optional["ToolDescriptor"]:
         """Return a ToolDescriptor by tool_id, checking world and schema caches."""
@@ -377,7 +383,10 @@ class ToolManager:
         # Provider tools expose complete/stream/etc rather than a single handler.
         # They have no callable registered in _world — routing goes through
         # LLMClient._PROVIDERS instead. Use a no-op sentinel.
-        if manifest.mode == "provider":
+        if manifest.mode == "provider" or manifest.direction in ("capture", "process"):
+            # Provider tools expose complete/stream/etc.
+            # Capture tools expose get_queue(); process tools expose push().
+            # None of these use the single-handler dispatch pattern.
             handler = None   # sentinel — not dispatched via Tool Manager
         else:
             handler_name = manifest.handler or "handle"
@@ -419,6 +428,8 @@ class ToolManager:
             mode               = manifest.mode,
             direction          = manifest.direction,
             subscriptions      = manifest.subscriptions,
+            emits              = manifest.emits,
+            consumes           = manifest.consumes,
         )
         self._world[tool_id]        = descriptor
         self._schema_cache[tool_id] = descriptor
