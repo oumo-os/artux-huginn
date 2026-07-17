@@ -35,6 +35,29 @@ World → Perception Manager → STM (Muninn) → Exilis → Sagax → Orchestra
 | **Orchestrator** | < 50 ms | Routing bridge. Token stream router, permission gate, speech chunker, nudge, ActuationBus publisher. |
 | **Logos** | Background | STM→LTM consolidation, skill synthesis, tool installation, instruction management. Sole LTM author. |
 
+```mermaid
+flowchart TD
+    World[World] 
+    --> PM[Perception Manager]
+    
+    PM --> STM[STM - Short-Term Memory]
+    
+    STM --> Exilis[Exilis Triage]
+    
+    Exilis --> Sagax[Sagax Planning]
+    Sagax --> Orchestrator[Orchestrator]
+    
+    Orchestrator <--> Tool[Tool Manager]
+    Tool --> World 
+    Actuate[Actuation Manager] <--> Orchestrator
+    Logos[Logos Consolidation] 
+    -.->|raw events| STM
+    Logos --> LTM[LTM - Long-Term Memory]
+    
+    STM -.-> LTM
+```
+
+
 ---
 
 ## How It Feels
@@ -135,6 +158,32 @@ detail came on demand.
 │                      │ entities    │                              │
 │                      └─────────────┘                              │
 └────────────────────────────────────────────────────────────────────┘
+```
+```mermaid
+flowchart LR
+    World[World Signals] --> PM[Perception Manager]
+    PM --> STM[Muninn STM]
+    
+    STM --> Exilis[Exilis Triage]
+    Exilis -->|Simple| FastPath[Fast Responder]
+    Exilis -->|Complex| Sagax[Sagax Planning]
+    
+    Sagax --> Narrator[Narrator Stream]
+    Narrator --> Orchestrator[Orchestrator]
+    
+    Orchestrator -->|Speech| TTS[TTS / Output]
+    Orchestrator -->|Action| Tools[External Tools]
+    
+    Logos[Logos Background] -->|Consolidation| MuninnLTM[Muninn LTM]
+    Logos -->|Skill Synthesis| Tools
+    
+    subgraph "Huginn - Cognitive Layer"
+        Exilis & Sagax & Logos & Orchestrator
+    end
+    
+    subgraph "Muninn - Memory Layer"
+        STM & MuninnLTM
+    end
 ```
 
 ---
@@ -513,6 +562,26 @@ def handle(param1: str, _muninn=None, _htm=None) -> dict:
 - `callable` — standard tool, `handle()` called synchronously
 - `service` — daemon thread, subscribes to ActuationBus, exposes `start/stop/handle`
 - `provider` — LLM inference backend, exposes `complete/stream/complete_json/complete_tools`
+
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Staging
+    participant Logos
+    participant Sagax
+    participant MuninnLTM
+    
+    User->>Staging: Drop new_tool.py
+    Logos->>Staging: Scan on next pass
+    Logos->>Sagax: Create staging task
+    Sagax->>User: "New tool detected. Install?"
+    User->>Sagax: Confirm
+    Sagax->>Logos: Approve
+    Logos->>MuninnLTM: Write tool descriptor
+    Logos->>Active: Move to active/
+    Logos->>Huginn: Register tool
+```
 
 ---
 
