@@ -693,7 +693,7 @@ class Logos:
         counts    = {
             "episodic": 0, "assertions": 0, "entity_updates": 0,
             "skills": 0, "procedures": 0, "errors": 0, "skipped": 0,
-            "tools_installed": 0,
+            "tools_installed": 0, "deduped": 0, "sources_cleaned": 0,
         }
 
         self.htm.states.set("logos.state", "consolidating", mark_dirty=False)
@@ -723,6 +723,11 @@ class Logos:
             return
 
         batch_end_id = raw_batch[-1].id
+
+        # Pre-consolidation dedup: collapse noisy duplicates (no LLM cost)
+        raw_batch, dedup_stats = self._deduplicate_batch(raw_batch)
+        if dedup_stats["collapsed"] > 0:
+            counts["deduped"] = dedup_stats["collapsed"]
 
         # -- Step 1: segment batch into coherent arcs, write one LTM entry per arc
         try:
@@ -794,6 +799,12 @@ class Logos:
         except Exception:
             pass
 
+        # -- Step 3b: clean up orphaned sources (media files, captures)
+        try:
+            counts["sources_cleaned"] = self._source_cleanup_pass()
+        except Exception:
+            pass
+
         # -- Step 4: verified — safe to flush
         self.stm.flush_up_to(batch_end_id)
         flushed = len(raw_batch)
@@ -806,6 +817,135 @@ class Logos:
         # -- Step 6: health event
         self.htm.states.set("logos.state", "sleep", mark_dirty=False)
         self._emit_health(pass_id, started, counts, stm_flushed=flushed)
+
+    # ------------------------------------------------------------------
+    # Noise pre-consolidation -- no LLM, pure Python
+    # ------------------------------------------------------------------
+
+    # Event types that should NEVER be collapsed even if their payloads
+    # look identical -- each represents a distinct meaningful action.
+    _NO_COLLAPSE_TYPES = frozenset([
+        "tool_result",    # each is a response to a distinct tool call
+        "speech",         # each is distinct user or system utterance
+        "cycle_note",     # each is a distinct Sagax reasoning cycle
+        "internal",       # system events -- often different subtype
+    ])
+
+    def _deduplicate_batch(
+        self, events: list[STMEvent]
+    ) -> tuple[list[STMEvent], dict]:
+        """
+        Collapse consecutive noisy duplicate events into span events.
+
+        A "run" is a maximal sequence of consecutive events where:
+          - source, type are identical
+          - type is not in _NO_COLLAPSE_TYPES
+          - The payload, stripped of id/ts/confidence fields, is identical
+            after normalisation (float rounding to 1 dp for sensor values,
+            ignoring keys whose names suggest they change every event).
+
+        A run of length 1 passes through unchanged.
+        A run of length N (N>1) is replaced by a single synthetic event
+        with metadata: collapsed, count, from_ts, to_ts, avg_confidence.
+
+        Returns (deduped_events, stats) where stats contains:
+          original, deduped, collapsed (number of runs that were collapsed)
+        """
+        import hashlib as _hl
+
+        _VOLATILE_KEYS = frozenset([
+            "ts", "id", "timestamp", "frame_id", "track_id",
+            "rms", "duration_ms", "request_id", "step",
+        ])
+
+        def _fingerprint(ev: STMEvent) -> str:
+            stripped = {}
+            for k, v in ev.payload.items():
+                if k in _VOLATILE_KEYS:
+                    continue
+                if isinstance(v, float):
+                    v = round(v, 1)
+                stripped[k] = v
+            key = json.dumps(
+                {"source": ev.source, "type": ev.type, "payload": stripped},
+                sort_keys=True, default=str,
+            )
+            return _hl.md5(key.encode()).hexdigest()
+
+        def _make_span(run: list[STMEvent]) -> STMEvent:
+            if len(run) == 1:
+                return run[0]
+            first, last = run[0], run[-1]
+            avg_conf = round(sum(e.confidence for e in run) / len(run), 3)
+            span_payload = dict(last.payload)
+            span_payload.update({
+                "collapsed":      True,
+                "count":          len(run),
+                "from_ts":        first.ts,
+                "to_ts":          last.ts,
+                "from_id":        first.id,
+                "to_id":          last.id,
+                "avg_confidence": avg_conf,
+            })
+            return STMEvent(
+                id=last.id, ts=last.ts,
+                source=last.source, type=last.type,
+                payload=span_payload,
+                confidence=avg_conf,
+            )
+
+        if not events:
+            return [], {"original": 0, "deduped": 0, "collapsed": 0}
+
+        result      = []
+        run         = [events[0]]
+        run_fp      = (
+            None if events[0].type in self._NO_COLLAPSE_TYPES
+            else _fingerprint(events[0])
+        )
+        collapsed   = 0
+
+        for ev in events[1:]:
+            if ev.type in self._NO_COLLAPSE_TYPES:
+                span = _make_span(run)
+                if len(run) > 1: collapsed += 1
+                result.append(span)
+                run    = [ev]
+                run_fp = None
+            else:
+                fp = _fingerprint(ev)
+                if fp == run_fp and run_fp is not None:
+                    run.append(ev)
+                else:
+                    span = _make_span(run)
+                    if len(run) > 1: collapsed += 1
+                    result.append(span)
+                    run    = [ev]
+                    run_fp = fp
+
+        span = _make_span(run)
+        if len(run) > 1: collapsed += 1
+        result.append(span)
+
+        return result, {
+            "original": len(events),
+            "deduped":  len(result),
+            "collapsed": collapsed,
+        }
+
+    def _source_cleanup_pass(self) -> int:
+        """
+        Delete orphaned sources: retention="delete_when_orphaned" with no
+        live LTM references.  Deletes both DB records and actual files.
+
+        Returns the number of sources deleted.
+        """
+        if not self.muninn:
+            return 0
+        try:
+            return self.muninn.sources.delete_orphaned()
+        except Exception:
+            return 0
 
     # ------------------------------------------------------------------
     # Narrative synthesis

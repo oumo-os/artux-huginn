@@ -43,6 +43,7 @@ from typing import Any, Callable, Optional
 
 from ..runtime.stm import STMStore
 from ..runtime.htm import HTM
+from ..runtime.denoise import DenoiseEngine
 from ..llm.client import LLMClient
 from ..llm.prompts import EXILIS_TRIAGE_v1, EXILIS_TRIAGE_USER_v1
 
@@ -106,6 +107,7 @@ class Exilis:
         self.on_act          = on_act
         self.on_urgent       = on_urgent
         self.idle_yield_s = idle_yield_s
+        self.denoise_engine = DenoiseEngine()
 
         self._last_processed_id: str = ""
         self._running = False
@@ -191,7 +193,12 @@ class Exilis:
         context      = self.stm.get_stm_window()
         active_tasks = self.htm.query(state="active|paused", initiated_by="sagax")
 
-        signal = self._triage(context, active_tasks, new_events)
+        # Denoise new events for context (preserves frequency info)
+        cons_n = self.stm.get_cons_n()
+        last_ctx_id = cons_n.last_event_id if cons_n else ""
+        denoised_events = self.denoise_engine.denoise(new_events, last_ctx_id)
+
+        signal = self._triage(context, active_tasks, denoised_events)
         if signal is None:
             return
 
@@ -257,7 +264,13 @@ class Exilis:
         self._last_processed_id = new_events[-1].id
         context      = self.stm.get_stm_window()
         active_tasks = self.htm.query(state="active|paused", initiated_by="sagax")
-        return self._triage(context, active_tasks, new_events)
+
+        # Denoise new events for context
+        cons_n = self.stm.get_cons_n()
+        last_ctx_id = cons_n.last_event_id if cons_n else ""
+        denoised_events = self.denoise_engine.denoise(new_events, last_ctx_id)
+
+        return self._triage(context, active_tasks, denoised_events)
 
 
 # ---------------------------------------------------------------------------

@@ -341,6 +341,7 @@ class ToolManager:
         stm,
         htm,
         activate_pipeline: bool = False,
+        skip_dependencies: bool = False,
     ) -> "ToolDescriptor":
         """
         Install a staged tool. Called by Logos after user affirmation.
@@ -360,7 +361,7 @@ class ToolManager:
         tool_id = manifest.tool_id
 
         # Step 1: pip dependencies
-        if manifest.dependencies:
+        if manifest.dependencies and not skip_dependencies:
             dep_errors = self._install_dependencies(manifest.dependencies, stm)
             if dep_errors:
                 stm.record(
@@ -809,6 +810,106 @@ class ToolManager:
             self.htm.asc.update_tool_usage(tool_id)
         except Exception:
             pass
+
+    # ------------------------------------------------------------------
+    # Uninstall / Reload (hot-reload support)
+    # ------------------------------------------------------------------
+
+    def uninstall_tool(self, tool_id: str, stm=None) -> bool:
+        """
+        Remove a tool from the runtime.  Stops any running daemon,
+        removes from registries, and unloads the module.
+
+        Returns True if the tool was found and removed, False otherwise.
+        """
+        descriptor = self._world.get(tool_id) or self._schema_cache.get(tool_id)
+        if descriptor is None:
+            return False
+
+        # Stop actuation daemon if running
+        if hasattr(self, '_actuation_manager') and self._actuation_manager is not None:
+            try:
+                self._actuation_manager.stop_tool(tool_id)
+            except Exception:
+                pass
+
+        # Remove from registries
+        self._world.pop(tool_id, None)
+        self._schema_cache.pop(tool_id, None)
+
+        # Unload module from sys.modules
+        module_name = f"huginn_tool_{tool_id.replace('.', '_').replace('-', '_')}"
+        sys.modules.pop(module_name, None)
+
+        # Remove from _modules if present
+        self._modules.pop(tool_id, None)
+
+        # Write STM event
+        if stm is not None:
+            stm.record(
+                source="system", type="internal",
+                payload={
+                    "subtype":   "tool_uninstalled",
+                    "tool_id":   tool_id,
+                    "source_path": descriptor.source_path,
+                },
+            )
+
+        return True
+
+    def reload_tool(
+        self,
+        tool_id: str,
+        stm=None,
+        htm=None,
+        skip_dependencies: bool = True,
+    ) -> Optional[ToolDescriptor]:
+        """
+        Hot-reload a tool: uninstall then re-install from the same source path.
+
+        For live service tools, the ActuationManager daemon is stopped and
+        restarted.  For callable tools, the handler reference is updated
+        immediately -- next call uses the new code.
+
+        Returns the new ToolDescriptor, or None if the tool was not found.
+        """
+        from .tool_discovery import parse_manifest
+
+        # 1. Get the source path before uninstalling
+        descriptor = self._world.get(tool_id) or self._schema_cache.get(tool_id)
+        if descriptor is None:
+            return None
+        source_path = descriptor.source_path
+        if not source_path:
+            return None
+
+        # 2. Parse the manifest from the source file
+        try:
+            source_code = Path(source_path).read_text(encoding="utf-8")
+            manifest = parse_manifest(source_code, source_path)
+        except Exception:
+            return None
+        if manifest is None:
+            return None
+
+        # 3. Uninstall
+        self.uninstall_tool(tool_id, stm=stm)
+
+        # 4. Re-install
+        try:
+            return self.install_tool(
+                manifest, stm=stm, htm=htm,
+                skip_dependencies=skip_dependencies,
+            )
+        except Exception:
+            return None
+
+    def set_actuation_manager(self, actuation_manager) -> None:
+        """
+        Register the ActuationManager reference so uninstall_tool()
+        can stop running service tools.
+        """
+        self._actuation_manager = actuation_manager
 
     # ------------------------------------------------------------------
     # Helpers for building tool result messages (Anthropic / OpenAI format)
