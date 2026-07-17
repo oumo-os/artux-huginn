@@ -469,13 +469,29 @@ ACTIVE TASKS in your context already shows active|paused tasks. At wake-up:
 
 ## Note entries (running commentary for Logos)
 
-  <task_update>{"action": "note",
-    "task_id": "task-mood-001",
-    "note": "Asked John about movie — Home Alone. Chose warm red/gold palette."
+Note entries are task-scoped memory — they persist with the task and become
+Logos's primary evidence for skill synthesis. Write rich notes; "Step 3 done"
+is not synthesis evidence. "Called tool.set_ceiling_lights with warm_red/60% —
+Home Alone palette, John's recalled preference for 60% during movies" is.
+
+  <task_update>{"action": "note", "task_id": "task-mood-001",
+    "note": "Asked John about movie — Home Alone. Christmas palette. Warm red/gold.",
+    "note_type": "decision"
   }</task_update>
 
-Notes build the execution trace Logos reads for skill synthesis. Be specific:
-include what was decided, why, and what result it produced.
+  <task_update>{"action": "note", "task_id": "task-mood-001",
+    "note": "tool.set_ceiling_lights returned: ok (colour=warm_red brightness=60)",
+    "note_type": "result"
+  }</task_update>
+
+note_type values (use these — Logos filters by them):
+  decision     — why a choice was made (what context, what reasoning)
+  result       — what a tool call returned or what actually happened
+  observation  — something noticed that's worth preserving
+  evidence     — explicit signal for Logos synthesis (use when something is noteworthy)
+  checkpoint   — step completion marker for notebook_entry steps (see skill_execution)
+
+Do NOT use: logos_examined — that is Logos's own internal marker.
 
 ## Edge cases
 
@@ -545,6 +561,39 @@ Some steps require explicit user approval before actuation (e.g. popcorn machine
   <speech target="entity-john-001">Mood is set! Want me to start the popcorn machine?</speech>
   [wait for next turn — do NOT auto-execute the step]
 
+## notebook_entry steps — required evidence writes
+
+Some skill steps have `notebook_entry: true`. These REQUIRE you to write a
+structured note to the task after completing the step. This is how skill
+execution traces become synthesis evidence for Logos.
+
+When a step has `notebook_entry: true`:
+  1. Execute the step normally
+  2. Write a checkpoint note before moving to the next step:
+
+  <task_update>{"action": "note", "task_id": "...",
+    "note": "[step:3] Set ceiling lights: warm_red at 60%. Home Alone palette. John prefers 60% for movies (recalled from entity.john.lighting_preference).",
+    "note_type": "checkpoint"
+  }</task_update>
+
+Checkpoint note format:
+  [step:N]        — the step number, so Logos can trace execution order
+  what happened   — tool name, args used, result
+  why             — the reasoning that led to this choice (recalled preference, user input, etc.)
+  what's next     — what the next step depends on (if relevant)
+
+Even for steps without `notebook_entry: true`, writing evidence notes is good
+practice when something interesting happens:
+  - A fallback was needed
+  - A preference was recalled and applied
+  - The user corrected something
+  - An unexpected result occurred
+
+  <task_update>{"action": "note", "task_id": "...",
+    "note": "Tool hint (find_light.v2) failed — wrong zone. Found switch_kitchen_store.v1 via recall.",
+    "note_type": "evidence"
+  }</task_update>
+
 ## Completing the skill
 
 When all steps are done, complete the HTM task with a structured output:
@@ -554,10 +603,13 @@ When all steps are done, complete the HTM task with a structured output:
     "confidence": 0.9
   }</task_update>
 
-The task notebook + raw events become Logos's evidence for skill synthesis.
-Detail in notes directly improves future skill quality.
+The task notebook is Logos's synthesis evidence — the richer the notes, the
+better the synthesised skill. Logos specifically looks for:
+  - checkpoint notes (step-by-step trace)
+  - evidence notes (friction, fallbacks, interesting decisions)
+  - decision notes (why specific values were chosen)
 
-See also: htm_tasks (task creation and parking), memory (recall for capabilities)
+See also: htm_tasks (task creation, parking, note types), memory (recall for capabilities)
 """
 
 
