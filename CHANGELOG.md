@@ -7,6 +7,47 @@ architectural changes, minor for additive capability, patch for docs/fixes.
 
 ---
 
+## v3.1.0 — Performance: Denoise, Dedup, Hot-Reload
+
+*191 tests.*
+
+### Added
+- `runtime/denoise.py` — `DenoiseEngine` for collapsing consecutive identical
+  sensor events into range format before any LLM sees the data. Zero LLM
+  cost (pure Python MD5 fingerprinting). 10-50x token savings on
+  IoT-heavy setups
+- `Exilis.denoise_engine` — denoises new events before triage using
+  ConsN boundary as watermark. Reduces Exilis LLM input tokens
+- `Logos._deduplicate_batch()` — pre-consolidation noise removal. Groups
+  consecutive events by fingerprint (source + type + normalised payload),
+  collapses runs into span events with metadata (count, from_ts, to_ts).
+  Reduces Logos consolidation LLM cost 10-50x
+- `Logos._source_cleanup_pass()` — deletes orphaned sources
+  (retention="delete_when_orphaned") with no live LTM references.
+  Prevents unbounded disk growth from captured media
+- `ToolManager.uninstall_tool()` — removes tool from runtime, stops
+  actuation daemon, unloads module from sys.modules
+- `ToolManager.reload_tool()` — hot-reload: uninstall then re-install
+  from same source path. Service tool daemons restarted, callable tool
+  handler references updated immediately
+- `ToolManager.set_actuation_manager()` — register ActuationManager
+  reference for service tool lifecycle management
+- `ToolManager.install_tool(skip_dependencies=)` — new parameter to skip
+  pip install during reload (default True for fast offline reload)
+
+### Changed
+- `Logos._pass()` — dedup runs on raw batch before segmentation; source
+  cleanup runs after skill synthesis; health event includes dedup and
+  cleanup counts
+- `llm/prompts.py` — ported note_type values, notebook_entry steps
+  section, and improved skill completion docs from anima (SAGAX STATE
+  retained)
+
+### Removed
+- `tools/staging/.huginn_known.json` — duplicate calendar entry fixed
+
+---
+
 ## v3.0.1 — Model Recommendation Refresh
 
 *Docs only — no code or test changes.*
