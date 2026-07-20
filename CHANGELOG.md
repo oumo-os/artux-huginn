@@ -43,6 +43,17 @@ architectural changes, minor for additive capability, patch for docs/fixes.
   section, and improved skill completion docs from anima (SAGAX STATE
   retained)
 
+### Design Decision: No pluggable memory backend (for now)
+Huginn has 57 coupling points to Muninn across 7 files (34 actual API
+calls: recall, consolidate_ltm, store_ltm, observe_entity, resolve_entity,
+delete_orphaned, ToolExecutor, get_tools). All imports are soft/lazy —
+Huginn runs without Muninn installed. A formal `MemoryBackend` protocol
+would require abstracting 7 API methods with 34 call sites, which is a
+large surface for unclear benefit. Muninn is the canonical backend
+(see: muninn-ltm merge, commit `2a8bb1c`). If Huginn graduates from
+"demo" to "framework", a protocol-based abstraction would make sense
+at that point.
+
 ### Removed
 - `tools/staging/.huginn_known.json` — duplicate calendar entry fixed
 
