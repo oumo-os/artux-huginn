@@ -8,7 +8,7 @@ No cognitive logic lives here. The Orchestrator:
   - Routes Sagax Narrator token stream to TTS / Tool Manager / HTM / UI
   - Enforces the permission gate on <tool_call> blocks
   - Dispatches <aug_call> inline (read-only, parallel, with timeouts)
-  - Issues the two-stage nudge on urgent Exilis signals
+  - Issues the two-stage nudge on interrupt Exilis signals
   - Ticks the HTM scheduler at 1 Hz
   - Writes workbook entries on every block close
 
@@ -544,7 +544,7 @@ class Orchestrator:
 
         # Stage 2: deliver context and wake Sagax with priority
         self.sagax.wake(signal=type("WakeSignal", (), {
-            "priority": "urgent", "event": event
+            "priority": "interrupt", "event": event
         })())
 
     # ------------------------------------------------------------------

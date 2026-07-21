@@ -53,9 +53,9 @@ from ..llm.prompts import EXILIS_TRIAGE_v1, EXILIS_TRIAGE_USER_v1
 # ---------------------------------------------------------------------------
 
 class TriageLabel:
-    IGNORE = "ignore"
-    ACT    = "act"
-    URGENT = "urgent"
+    HOLD      = "hold"
+    ACT       = "act"
+    INTERRUPT = "interrupt"
 
 
 class TriageSignal:
@@ -84,7 +84,7 @@ class Exilis:
     on_act : callable
         Called when triage == "act". Orchestrator queues Sagax wake.
     on_urgent : callable(event)
-        Called when triage == "urgent". Orchestrator issues nudge.
+        Called when triage == "interrupt". Orchestrator issues nudge.
     idle_yield_s : float
         Seconds between polls when no new events. Default 0.005 (5 ms).
     """
@@ -202,11 +202,11 @@ class Exilis:
         if signal is None:
             return
 
-        if signal.label == TriageLabel.URGENT:
+        if signal.label == TriageLabel.INTERRUPT:
             self.on_urgent(new_events[-1])
         elif signal.label == TriageLabel.ACT:
             self.on_act()
-        # ignore → nothing
+        # hold → nothing
 
     # ------------------------------------------------------------------
     # LLM triage call
@@ -237,7 +237,7 @@ class Exilis:
             )
             label  = result.get("triage", TriageLabel.ACT)
             reason = result.get("reason", "")
-            if label not in (TriageLabel.IGNORE, TriageLabel.ACT, TriageLabel.URGENT):
+            if label not in (TriageLabel.HOLD, TriageLabel.ACT, TriageLabel.INTERRUPT):
                 label = TriageLabel.ACT
             return TriageSignal(label=label, reason=reason)
 

@@ -1989,7 +1989,7 @@ class TestExilisLoop(unittest.TestCase):
         from huginn.agents.exilis import TriageSignal, TriageLabel
         h.exilis._triage = lambda *a, **kw: (
             triage_calls.append(True),
-            TriageSignal(label=TriageLabel.IGNORE, reason="test")
+            TriageSignal(label=TriageLabel.HOLD, reason="test")
         )[1]
 
         # Advance cursor past any startup events so nothing is pending
@@ -2004,13 +2004,13 @@ class TestExilisLoop(unittest.TestCase):
     def test_exilis_tick_runs_triage_when_pending(self):
         """_tick calls _triage when events_pending is True."""
         muninn = MockMuninn()
-        h      = _build_huginn_with_mock_llm(muninn=muninn)
+        h      = _build_anima_with_mock_llm(muninn=muninn)
         triage_calls = []
 
         from huginn.agents.exilis import TriageSignal, TriageLabel
         h.exilis._triage = lambda *a, **kw: (
             triage_calls.append(True),
-            TriageSignal(label=TriageLabel.IGNORE, reason="test")
+            TriageSignal(label=TriageLabel.HOLD, reason="test")
         )[1]
 
         # Write an event, then tick

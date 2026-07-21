@@ -68,7 +68,7 @@ from ..llm.sagax_prompts import (
 
 @dataclass
 class WakeSignal:
-    priority: str = "normal"   # "normal" | "urgent"
+    priority: str = "normal"   # "normal" | "interrupt"
     event:    Optional[STMEvent] = None
 
 
@@ -335,8 +335,8 @@ class Sagax:
           simple user query  → respond
           default            → plan
         """
-        # 1. Urgent interrupt — respond immediately, no tools
-        if getattr(signal, "priority", "normal") == "urgent":
+        # 1. Interrupt — respond immediately, no tools
+        if getattr(signal, "priority", "normal") == "interrupt":
             return "respond"
 
         # 2. Tool staging — highest priority non-urgent task

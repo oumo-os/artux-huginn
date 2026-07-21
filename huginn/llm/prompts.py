@@ -28,18 +28,18 @@ You are given:
 The last event in NEW EVENTS is the one that triggered this check.
 
 Output EXACTLY one JSON object — nothing else:
-  {"triage": "ignore" | "act" | "urgent", "reason": "<one sentence>"}
+  {"triage": "hold" | "act" | "interrupt", "reason": "<one sentence>"}
 
 Definitions:
 
-  ignore → This event requires no response. Sagax can continue what it is
-           doing (or stay asleep). Use for:
-             • Listener backchannels: "mm-hmm", "yeah", "okay", "uh-huh"
-             • Ambient/background noise detected by the microphone
-             • Duplicate or near-duplicate sensor readings with no state change
-             • Sagax's own speech being picked up by the microphone
-             • System heartbeats, pipeline health ticks
-             • A completed tool result for a task Sagax is already tracking
+  hold → This event is real but Sagax does not need to wake for it now.
+         Sagax and Logos will see it on their next cycle. Use for:
+           • Listener backchannels: "mm-hmm", "yeah", "okay", "uh-huh"
+           • Ambient/background noise detected by the microphone
+           • Duplicate or near-duplicate sensor readings with no state change
+           • Sagax's own speech being picked up by the microphone
+           • System heartbeats, pipeline health ticks
+           • A completed tool result for a task Sagax is already tracking
 
   act    → This event warrants Sagax's attention on its next natural cycle.
            Sagax is not mid-speech, or this is not time-critical. Use for:
@@ -48,24 +48,24 @@ Definitions:
              • A sensor event that updates context (arrival, state change)
              • A scheduled task becoming due
 
-  urgent → This event requires immediate interruption of Sagax's current
-           output. Use sparingly. Use for:
-             • The user speaks a substantive new request while Sagax
-               is mid-sentence (not a backchannel)
-             • The user says "stop", "wait", "cancel", "actually"
-             • An emergency or departure sensor event during active speech
-             • Any safety-critical signal
+  interrupt → This event requires immediate interruption of Sagax's current
+              output. Use sparingly. Use for:
+                • The user speaks a substantive new request while Sagax
+                  is mid-sentence (not a backchannel)
+                • The user says "stop", "wait", "cancel", "actually"
+                • An emergency or departure sensor event during active speech
+                • Any safety-critical signal
 
-SAGAX STATE affects the act/urgent threshold:
-  active  — Sagax is mid-stream. Raise the bar: only use urgent for clear
+SAGAX STATE affects the act/interrupt threshold:
+  active  — Sagax is mid-stream. Raise the bar: only use interrupt for clear
             interruptions (explicit stop, safety, departure). Substantive
             new requests that can wait → use act (queued for natural pause).
-  paused  — Sagax was interrupted. Use act freely; urgent only if critical.
+  paused  — Sagax was interrupted. Use act freely; interrupt only if critical.
   waiting — Normal thresholds apply.
 
-When in doubt between ignore and act: choose act.
-When in doubt between act and urgent: choose act.
-Only choose urgent when there is a clear reason to interrupt immediately.
+When in doubt between hold and act: choose act.
+When in doubt between act and interrupt: choose act.
+Only choose interrupt when there is a clear reason to interrupt immediately.
 """
 
 EXILIS_TRIAGE_USER_v1 = """
