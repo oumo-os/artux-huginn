@@ -7,6 +7,33 @@ architectural changes, minor for additive capability, patch for docs/fixes.
 
 ---
 
+## v4.0.0 — Triage Label Rename (Breaking)
+
+### Breaking Changes
+- **Exilis triage labels renamed:** `ignore` → `hold`, `urgent` → `interrupt`
+  - `TriageLabel.IGNORE` removed, use `TriageLabel.HOLD`
+  - `TriageLabel.URGENT` removed, use `TriageLabel.INTERRUPT`
+  - `WakeSignal.priority` value `"urgent"` → `"interrupt"`
+  - `EXILIS_TRIAGE_v1` prompt output format: `"hold" | "act" | "interrupt"`
+  - Any external code checking `triage == "ignore"` or `triage == "urgent"` will break
+
+### Changed
+- `huginn/agents/exilis.py` — `TriageLabel` enum: `HOLD`, `ACT`, `INTERRUPT`
+- `huginn/agents/sagax.py` — `WakeSignal.priority` checks `== "interrupt"`
+- `huginn/runtime/orchestrator.py` — nudge signal emits `priority: "interrupt"`
+- `huginn/llm/prompts.py` — `EXILIS_TRIAGE_v1` reworded with new labels and semantics
+
+### Rationale
+- **`hold`** accurately describes the behavior: real event, Sagax doesn't need to
+  wake now, will be seen on next cycle. Exilis is an attention gate, not an event filter.
+- **`interrupt`** matches the behavior: Sagax is stopped mid-stream, work is parked,
+  focused response mode entered. The codebase already used "interrupt" as the behavior name.
+
+### Documentation
+- `ADR-exilis-triage-labels.md` — full decision record
+
+---
+
 ## v3.1.0 — Performance: Denoise, Dedup, Hot-Reload
 
 *191 tests.*
