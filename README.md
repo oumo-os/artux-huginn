@@ -30,7 +30,7 @@ World → Perception Manager → STM (Muninn) → Exilis → Sagax → Orchestra
 | Component | Speed | Role |
 |---|---|---|
 | **Perception Manager** | Continuous | Runs active perception pipeline tasks from HTM. Resolves biometric signatures. Writes canonical events to STM. No LLM. |
-| **Exilis** | < 70 ms | Woken on each new STM event. One batched LLM triage call. Emits `ignore / act / urgent`. Never writes, never actuates. |
+| **Exilis** | < 70 ms | Woken on each new STM event. One batched LLM triage call. Emits `hold / act / interrupt`. Never writes, never actuates. |
 | **Sagax** | 1–30 s | Recall-driven reasoning. Reads STM + HTM tasks + live states. Produces structured Narrator token stream. |
 | **Orchestrator** | < 50 ms | Routing bridge. Token stream router, permission gate, speech chunker, nudge, ActuationBus publisher. |
 | **Logos** | Background | STM→LTM consolidation, skill synthesis, tool installation, instruction management. Sole LTM author. |
@@ -69,7 +69,7 @@ flowchart TD
 John asks for movie mood lighting. Sagax recalls `skill.set_movie_mood`,
 creates an HTM task, asks what film, sets ceiling and wall lights to warm red and
 gold. Before the popcorn step, John's phone rings and he walks out. Exilis
-classifies the departure as `urgent`. The Orchestrator halts TTS, suspends
+classifies the departure as `interrupt`. The Orchestrator halts TTS, suspends
 the open speech block, parks the task with `resume_at: step_6_popcorn`. Sagax
 pivots cleanly. When John returns, his voiceprint is matched at the door,
 the session grants reload, and Sagax reads the task notebook — steps 1–5
@@ -126,7 +126,7 @@ detail came on demand.
 │  │                       ORCHESTRATOR                           │  │
 │  │                                                              │  │
 │  │  Perception Manager ──► STM ──► Exilis ──► Routing          │  │
-│  │  (pipeline runner,      │       (triage     (act/urgent)    │  │
+│  │  (pipeline runner,      │       (triage     (act/interrupt)    │  │
 │  │   sig resolution)       │        < 70ms)         │          │  │
 │  │                         │                         ▼         │  │
 │  │  ActuationBus ◄─ Speech chunker              Sagax          │  │
