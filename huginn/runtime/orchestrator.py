@@ -436,6 +436,53 @@ class Orchestrator:
         """Public proxy — called directly if needed outside a tool_call context."""
         self.logos.request_early_cycle()
 
+    # ------------------------------------------------------------------
+    # State-change / tool-failure event sinks (wired to HTM + ToolManager)
+    # ------------------------------------------------------------------
+
+    def _on_task_state_change(self, task_id: str, from_state: str,
+                              to_state: str, task) -> None:
+        """
+        HTM state-change sink: every persist-task transition becomes an
+        observable internal STM event. Volatile bookkeeping records are
+        excluded (they never hit the DB). Logos consolidates all raw
+        events — everything is a memory.
+        """
+        if task.persistence != "persist":
+            return
+        self.stm.record(
+            source="system", type="internal",
+            payload={
+                "subtype": "task_state_changed",
+                "task_id": task_id,
+                "title": task.title,
+                "from": from_state,
+                "to": to_state,
+                "initiated_by": task.initiated_by,
+            },
+        )
+
+    def _on_tool_failure(self, tool_id: str, error: str = "") -> None:
+        """
+        Tool-failure sink: records a tool_failure STM event and pushes
+        through Exilis so Sagax wakes and can log a reminder task or
+        flag Logos' attention. Soft signal only — the failure is
+        recorded; Sagax decides whether to act on it.
+        """
+        self.stm.record(
+            source="system", type="internal",
+            payload={
+                "subtype": "tool_failure",
+                "tool_id": tool_id,
+                "error": error,
+            },
+        )
+        # Nudge Sagax so it sees the failure on its next cycle.
+        try:
+            self.sagax.wake()
+        except Exception:
+            pass
+
     def stop(self):
         self._running = False
         self.exilis.stop()

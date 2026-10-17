@@ -21,6 +21,7 @@ Design invariants (from CognitiveModule.md §2.2):
 from __future__ import annotations
 
 import json
+import threading
 import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
@@ -150,7 +151,14 @@ def _get_conn(db_path: str):
                 ":memory:", check_same_thread=False
             )
         return _MEMORY_CONNS[db_path]
-    return sqlite3.connect(db_path, check_same_thread=False)
+    # File-backed: single shared connection, WAL for concurrent readers +
+    # a single writer, timeout to avoid SQLITE_BUSY under contention.
+    conn = sqlite3.connect(db_path, check_same_thread=False, timeout=30)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+    except Exception:
+        pass
+    return conn
 
 
 def _ensure_huginn_tables(db_path: str):
@@ -229,6 +237,11 @@ class STMStore:
             or getattr(getattr(muninn, "db", None), "db_path", None)
             or "huginn.db"
         )
+        # Serializes concurrent readers/writers: the Logos thread flushes,
+        # Perception/Sagax write, Exilis polls. One shared lock keeps the
+        # cursor-advance / flush pair atomic so no event is lost between
+        # the flush query and rebind.
+        self._lock = threading.RLock()
         _ensure_huginn_tables(self._db_path)
 
         # In-memory caches — rebuilt on first access
@@ -295,19 +308,21 @@ class STMStore:
         Written to huginn_events table (not Muninn's STMManager).
         Returns the event with its assigned id.
         """
-        self._ensure_loaded()
-        event = STMEvent.make(source=source, type=type,
-                              payload=payload, confidence=confidence)
-        self._write_event(event)
-        self._events.append(event)
-        return event
+        with self._lock:
+            self._ensure_loaded()
+            event = STMEvent.make(source=source, type=type,
+                                  payload=payload, confidence=confidence)
+            self._write_event(event)
+            self._events.append(event)
+            return event
 
     def record_event(self, event: STMEvent) -> STMEvent:
         """Persist a pre-constructed STMEvent."""
-        self._ensure_loaded()
-        self._write_event(event)
-        self._events.append(event)
-        return event
+        with self._lock:
+            self._ensure_loaded()
+            self._write_event(event)
+            self._events.append(event)
+            return event
 
     def _write_event(self, event: STMEvent):
         conn = _get_conn(self._db_path)
@@ -333,29 +348,30 @@ class STMStore:
         This is what Sagax reads on each wake-up.
         Exilis reads this same window for triage context.
         """
-        self._ensure_loaded()
-        cons_n = self._cons_n
+        with self._lock:
+            self._ensure_loaded()
+            cons_n = self._cons_n
 
-        if cons_n is None or not cons_n.last_event_id:
+            if cons_n is None or not cons_n.last_event_id:
+                return {
+                    "cons_n_text":    "",
+                    "cons_n_version": 0,
+                    "cons_n_topics":  [],
+                    "new_events":     list(self._events),
+                    "cold_start":     True,
+                }
+
+            anchor = self._index_of(cons_n.last_event_id)
+            new_events = (
+                self._events[anchor + 1:] if anchor >= 0 else list(self._events)
+            )
             return {
-                "cons_n_text":    "",
-                "cons_n_version": 0,
-                "cons_n_topics":  [],
-                "new_events":     list(self._events),
-                "cold_start":     True,
+                "cons_n_text":    cons_n.summary_text,
+                "cons_n_version": cons_n.version,
+                "cons_n_topics":  cons_n.topics,
+                "new_events":     new_events,
+                "cold_start":     False,
             }
-
-        anchor = self._index_of(cons_n.last_event_id)
-        new_events = (
-            self._events[anchor + 1:] if anchor >= 0 else list(self._events)
-        )
-        return {
-            "cons_n_text":    cons_n.summary_text,
-            "cons_n_version": cons_n.version,
-            "cons_n_topics":  cons_n.topics,
-            "new_events":     new_events,
-            "cold_start":     False,
-        }
 
     def get_raw_events(
         self,
@@ -368,27 +384,29 @@ class STMStore:
         Stops a few events short of tLast to avoid racing Perception Manager.
         Logos passes logos_watermark as after_id.
         """
-        self._ensure_loaded()
-        events = self._events
+        with self._lock:
+            self._ensure_loaded()
+            events = self._events
 
-        if after_id:
-            anchor = self._index_of(after_id)
-            events = events[anchor + 1:] if anchor >= 0 else list(events)
+            if after_id:
+                anchor = self._index_of(after_id)
+                events = events[anchor + 1:] if anchor >= 0 else list(events)
 
-        # Leave 3-event safety margin at the head (still being written)
-        safe = max(0, len(events) - 3)
-        return events[:safe][:limit]
+            # Leave 3-event safety margin at the head (still being written)
+            safe = max(0, len(events) - 3)
+            return events[:safe][:limit]
 
     def get_events_after(self, last_id: str) -> list[STMEvent]:
         """
         All events with id > last_id, including the freshest ones.
         Used by Exilis — no safety margin needed (it reads but never flushes).
         """
-        self._ensure_loaded()
-        if not last_id:
-            return list(self._events)
-        anchor = self._index_of(last_id)
-        return self._events[anchor + 1:] if anchor >= 0 else list(self._events)
+        with self._lock:
+            self._ensure_loaded()
+            if not last_id:
+                return list(self._events)
+            anchor = self._index_of(last_id)
+            return self._events[anchor + 1:] if anchor >= 0 else list(self._events)
 
     def events_pending(self, since_id: str) -> bool:
         """
@@ -401,6 +419,7 @@ class STMStore:
         Equivalent to: len(get_events_after(since_id)) > 0
         but ~10x cheaper because it short-circuits on the first row.
         """
+        self._ensure_loaded()
         conn = _get_conn(self._db_path)
         if since_id:
             row = conn.execute(
@@ -416,20 +435,23 @@ class STMStore:
 
     def get_logos_watermark(self) -> str:
         """Return the id of the last event Logos has consolidated and flushed."""
-        self._ensure_loaded()
-        return self._watermark
+        with self._lock:
+            self._ensure_loaded()
+            return self._watermark
 
     def get_cons_n(self) -> Optional[ConsN]:
-        self._ensure_loaded()
-        return self._cons_n
+        with self._lock:
+            self._ensure_loaded()
+            return self._cons_n
 
     def event_count_after_cons_n(self) -> int:
         """Number of raw events in the new-event window."""
-        self._ensure_loaded()
-        if not self._cons_n or not self._cons_n.last_event_id:
-            return len(self._events)
-        anchor = self._index_of(self._cons_n.last_event_id)
-        return max(0, len(self._events) - (anchor + 1))
+        with self._lock:
+            self._ensure_loaded()
+            if not self._cons_n or not self._cons_n.last_event_id:
+                return len(self._events)
+            anchor = self._index_of(self._cons_n.last_event_id)
+            return max(0, len(self._events) - (anchor + 1))
 
     def event_count_since_cons_n(self) -> int:
         """Alias used by Sagax's cycle-note consN path."""
@@ -462,41 +484,42 @@ class STMStore:
         topic_hints : list[str]
             Topics Sagax already identified; merged into consN.meta.
         """
-        self._ensure_loaded()
-        window = self.get_stm_window()
-        new_events = window["new_events"]
+        with self._lock:
+            self._ensure_loaded()
+            window = self.get_stm_window()
+            new_events = window["new_events"]
 
-        if not force and len(new_events) < CONS_N_MIN_NEW:
-            return None
+            if not force and len(new_events) < CONS_N_MIN_NEW:
+                return None
 
-        current = self._cons_n or ConsN.empty()
+            current = self._cons_n or ConsN.empty()
 
-        # Fold first half; keep second half as live window for Sagax
-        fold_count = max(1, len(new_events) // 2) if len(new_events) > 1 \
-                     else len(new_events)
-        to_fold    = new_events[:fold_count]
-        if not to_fold:
-            return None
+            # Fold first half; keep second half as live window for Sagax
+            fold_count = max(1, len(new_events) // 2) if len(new_events) > 1 \
+                         else len(new_events)
+            to_fold    = new_events[:fold_count]
+            if not to_fold:
+                return None
 
-        new_text   = self._summarise(current.summary_text, to_fold)
-        topics     = list(set(
-            (topic_hints or []) + _extract_topics(to_fold) + current.topics
-        ))[:20]
+            new_text   = self._summarise(current.summary_text, to_fold)
+            topics     = list(set(
+                (topic_hints or []) + _extract_topics(to_fold) + current.topics
+            ))[:20]
 
-        new_cons_n = ConsN(
-            summary_id         = f"consN_v{current.version + 1}",
-            last_event_id      = to_fold[-1].id,
-            summary_text       = new_text,
-            version            = current.version + 1,
-            created_at         = _utcnow(),
-            topics             = topics,
-            confidence         = min((e.confidence for e in to_fold), default=1.0),
-            event_count_folded = current.event_count_folded + fold_count,
-        )
+            new_cons_n = ConsN(
+                summary_id         = f"consN_v{current.version + 1}",
+                last_event_id      = to_fold[-1].id,
+                summary_text       = new_text,
+                version            = current.version + 1,
+                created_at         = _utcnow(),
+                topics             = topics,
+                confidence         = min((e.confidence for e in to_fold), default=1.0),
+                event_count_folded = current.event_count_folded + fold_count,
+            )
 
-        self._persist_cons_n(new_cons_n)
-        self._cons_n = new_cons_n
-        return new_cons_n
+            self._persist_cons_n(new_cons_n)
+            self._cons_n = new_cons_n
+            return new_cons_n
 
     # ------------------------------------------------------------------
     # Logos flush — called by Logos only
@@ -508,27 +531,32 @@ class STMStore:
         Advances logos_watermark.
         Called by Logos after verified LTM writes.
         Returns the number of events flushed.
+
+        The entire query→delete→rebind sequence is one critical section,
+        so no event appended between the flush query and the rebind is
+        lost (shared lock with writers).
         """
-        self._ensure_loaded()
-        anchor = self._index_of(event_id)
-        if anchor < 0:
-            return 0
+        with self._lock:
+            self._ensure_loaded()
+            anchor = self._index_of(event_id)
+            if anchor < 0:
+                return 0
 
-        to_flush = self._events[:anchor + 1]
-        keep     = self._events[anchor + 1:]
+            to_flush = self._events[:anchor + 1]
+            keep     = self._events[anchor + 1:]
 
-        flush_ids = [e.id for e in to_flush]
-        conn = _get_conn(self._db_path)
-        conn.executemany(
-            "DELETE FROM huginn_events WHERE id = ?",
-            [(eid,) for eid in flush_ids]
-        )
-        conn.commit()
+            flush_ids = [e.id for e in to_flush]
+            conn = _get_conn(self._db_path)
+            conn.executemany(
+                "DELETE FROM huginn_events WHERE id = ?",
+                [(eid,) for eid in flush_ids]
+            )
+            conn.commit()
 
-        self._events    = keep
-        self._watermark = event_id
-        self._persist_watermark()
-        return len(to_flush)
+            self._events    = keep
+            self._watermark = event_id
+            self._persist_watermark()
+            return len(to_flush)
 
     # ------------------------------------------------------------------
     # Sentinel persistence

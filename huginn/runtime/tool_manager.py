@@ -53,6 +53,7 @@ import importlib.util
 import json
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -193,6 +194,16 @@ class ToolManager:
         # Schema cache: avoids repeated LTM lookups for known tools
         self._schema_cache: dict[str, ToolDescriptor] = {}
 
+        # Serializes registry mutations (register/install/uninstall/reload)
+        # and the tool-health ledger query→roll→create→note sequence, so
+        # concurrent failures can never spawn a second active ledger entry.
+        self._lock = threading.RLock()
+
+        # Failure sink: wired by the runtime builder (Orchestrator) so every
+        # failed dispatch becomes observable STM history and wakes Sagax.
+        # Signature: on_tool_failure(tool_id, error)
+        self.on_tool_failure: Optional[Callable[[str, str], None]] = None
+
     # ------------------------------------------------------------------
     # Registration (world tools)
     # ------------------------------------------------------------------
@@ -211,12 +222,13 @@ class ToolManager:
         The descriptor must be stored in Muninn LTM separately (see README
         for the consolidate_ltm() call pattern).
         """
-        if descriptor is None:
-            descriptor = self._fetch_descriptor_from_ltm(tool_id)
-        descriptor.handler = handler
-        descriptor.tier    = "world"
-        self._world[tool_id]         = descriptor
-        self._schema_cache[tool_id]  = descriptor
+        with self._lock:
+            if descriptor is None:
+                descriptor = self._fetch_descriptor_from_ltm(tool_id)
+            descriptor.handler = handler
+            descriptor.tier    = "world"
+            self._world[tool_id]         = descriptor
+            self._schema_cache[tool_id]  = descriptor
 
     def world_descriptors(self) -> list:
         """Return all installed world-tier ToolDescriptors."""
@@ -253,46 +265,54 @@ class ToolManager:
 
         Memory tools (tier 1) → ToolExecutor → MemoryAgent
         World tools  (tier 2) → registered handler callable
-        """
-        t0 = time.monotonic()
 
-        # Tier 1: memory tools
-        if tool_id in _MEMORY_POLARITY:
-            try:
-                # Native Huginn tools bypass Muninn's ToolExecutor entirely
-                if tool_id in _NATIVE_TOOLS:
-                    output = self._execute_native(tool_id, args)
+        Serialized under self._lock so concurrent dispatches cannot
+        interleave registry mutations with in-flight calls.
+        """
+        with self._lock:
+            t0 = time.monotonic()
+
+            # Tier 1: memory tools
+            if tool_id in _MEMORY_POLARITY:
+                try:
+                    # Native Huginn tools bypass Muninn's ToolExecutor entirely
+                    if tool_id in _NATIVE_TOOLS:
+                        output = self._execute_native(tool_id, args)
+                        self._record_health(tool_id, True)
+                        return ToolResult(
+                            tool_id     = tool_id,
+                            success     = True,
+                            output      = output,
+                            polarity    = "read",
+                            duration_ms = int((time.monotonic() - t0) * 1000),
+                        )
+                    output = self._memory_executor.execute(tool_id, args)
+                    self._record_health(tool_id, True)
                     return ToolResult(
-                        tool_id     = tool_id,
-                        success     = True,
-                        output      = output,
-                        polarity    = "read",
+                        tool_id    = tool_id,
+                        success    = True,
+                        output     = output,
+                        polarity   = _MEMORY_POLARITY[tool_id],
                         duration_ms = int((time.monotonic() - t0) * 1000),
                     )
-                output = self._memory_executor.execute(tool_id, args)
-                return ToolResult(
-                    tool_id    = tool_id,
-                    success    = True,
-                    output     = output,
-                    polarity   = _MEMORY_POLARITY[tool_id],
-                    duration_ms = int((time.monotonic() - t0) * 1000),
-                )
-            except Exception as e:
-                return ToolResult(
-                    tool_id    = tool_id,
-                    success    = False,
-                    output     = "",
-                    error      = str(e),
-                    polarity   = _MEMORY_POLARITY.get(tool_id, "write"),
-                    duration_ms = int((time.monotonic() - t0) * 1000),
-                )
+                except Exception as e:
+                    self._record_health(tool_id, False, str(e))
+                    return ToolResult(
+                        tool_id    = tool_id,
+                        success    = False,
+                        output     = "",
+                        error      = str(e),
+                        polarity   = _MEMORY_POLARITY.get(tool_id, "write"),
+                        duration_ms = int((time.monotonic() - t0) * 1000),
+                    )
 
-        # Tier 2: world tools
-        descriptor = self._world.get(tool_id)
-        if descriptor is None:
-            # Try to lazy-load from LTM (handler not registered — schema only)
-            descriptor = self._fetch_descriptor_from_ltm(tool_id)
+            # Tier 2: world tools
+            descriptor = self._world.get(tool_id)
+            if descriptor is None:
+                # Try to lazy-load from LTM (handler not registered — schema only)
+                descriptor = self._fetch_descriptor_from_ltm(tool_id)
             if descriptor.handler is None:
+                self._record_health(tool_id, False, "tool_not_registered")
                 return ToolResult(
                     tool_id = tool_id,
                     success = False,
@@ -302,34 +322,237 @@ class ToolManager:
                     duration_ms = int((time.monotonic() - t0) * 1000),
                 )
 
-        try:
-            # Inject _muninn if the handler declares it as a parameter.
-            # This lets tools like tool_config_write.py access LTM directly
-            # without coupling to Huginn internals.
-            import inspect
+            try:
+                # Inject _muninn if the handler declares it as a parameter.
+                # This lets tools like tool_config_write.py access LTM directly
+                # without coupling to Huginn internals.
+                import inspect
+                call_args = dict(args)
+                sig = inspect.signature(descriptor.handler)
+                if "_muninn" in sig.parameters:
+                    call_args["_muninn"] = self.muninn
+                result = descriptor.handler(**call_args)
+                output = result if isinstance(result, dict) else {"output": result}
+                self._update_hot_tools(tool_id, descriptor)
+                self._record_health(tool_id, True, descriptor=descriptor)
+                return ToolResult(
+                    tool_id    = tool_id,
+                    success    = True,
+                    output     = output,
+                    polarity   = descriptor.polarity,
+                    duration_ms = int((time.monotonic() - t0) * 1000),
+                )
+            except Exception as e:
+                self._record_health(tool_id, False, str(e), descriptor)
+                return ToolResult(
+                    tool_id    = tool_id,
+                    success    = False,
+                    output     = {},
+                    error      = str(e),
+                    polarity   = descriptor.polarity,
+                    duration_ms = int((time.monotonic() - t0) * 1000),
+                )
+
+    def _record_health(
+        self,
+        tool_id:   str,
+        success:   bool,
+        error:     str = "",
+        descriptor: Optional[ToolDescriptor] = None,
+    ) -> None:
+        """
+        Record a dispatch outcome in the ASC health ledger and fire the
+        on_tool_failure sink on failure. Single chokepoint for health
+        tracking — mirrors anima's _record_health design.
+        """
+        if self.htm is not None:
+            try:
+                if success:
+                    self.htm.asc.record_tool_success(
+                        tool_id,
+                        title=(descriptor.title if descriptor else ""),
+                        capability_summary=(
+                            descriptor.capability_summary if descriptor else ""),
+                        polarity=(descriptor.polarity if descriptor
+                                  else _MEMORY_POLARITY.get(tool_id, "write")),
+                        permission_scope=(
+                            descriptor.permission_scope if descriptor else []),
+                        mode=(descriptor.mode if descriptor else "callable"),
+                    )
+                else:
+                    self.htm.asc.record_tool_failure(tool_id, error)
+            except Exception:
+                pass
+        if not success and self.on_tool_failure is not None:
+            try:
+                self.on_tool_failure(tool_id, error)
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
+    # Capability resolution — action tags → exact tool
+    # ------------------------------------------------------------------
+
+    def prepare_capability(
+        self,
+        tags:   list[str] | str,
+        query:  str,
+        args:   dict = None,
+    ) -> dict:
+        """
+        Resolve a capability (action tag) to an exact tool for dispatch.
+
+        Sagax emits {"action": "TAG", "query": "plain-language request"} without
+        knowing exact tool ids or schemas. This resolver picks the best tool:
+
+          1. Hot-capabilities cache (htm.asc.hot_capabilities) — recently used
+             tools whose permission_scope overlaps the requested tags.
+          2. LTM recall fallback (topics=["tool"] + tags) for tools not yet hot.
+
+        Returns a dict:
+          {"status": "exact"|"resolved"|"conflict"|"unavailable",
+           "descriptor": ToolDescriptor | None,
+           "call_args": dict,          # merged args + query mapping
+           "candidates": list[dict],   # for conflict/unavailable
+           "reason": str}
+
+        "exact"   → one hot tool matches; ready to dispatch.
+        "resolved"→ one LTM-recalled tool matches; registered on the fly.
+        "conflict"→ several close candidates; Sagax picks (or reports missing).
+        "unavailable" → no candidate; record a capability gap.
+        """
+        args = args or {}
+        if isinstance(tags, str):
+            tags = [tags]
+        tags = [t.strip() for t in tags if t and t.strip()]
+        if not tags:
+            return {
+                "status": "unavailable",
+                "descriptor": None,
+                "call_args": {},
+                "candidates": [],
+                "reason": "no capability tags provided",
+            }
+
+        htm = self.htm
+        hot_tools = {}
+        if htm is not None:
+            try:
+                hot_tools = htm.asc.get("hot_capabilities") or {}
+            except Exception:
+                hot_tools = {}
+
+        # --- Stage 1: hot-cache exact/overlap match ---------------------
+        scored = []
+        for tid, hot in hot_tools.items():
+            scope = hot.permission_scope if isinstance(hot, HotTool) \
+                else (hot.get("permission_scope") if isinstance(hot, dict) else [])
+            overlap = [t for t in tags if t in scope]
+            if overlap:
+                scored.append((len(overlap), hot.last_used if hasattr(hot, "last_used") else "", tid, hot))
+
+        scored.sort(key=lambda x: (-x[0], x[1]), reverse=False)
+        # Sort: most overlaps first, then most recently used.
+        scored.sort(key=lambda x: (-x[0], x[1]))
+
+        if len(scored) == 1:
+            _, _, tid, hot = scored[0]
+            descriptor = hot if isinstance(hot, ToolDescriptor) else self._world.get(tid) or self._schema_cache.get(tid)
+            if descriptor is None:
+                descriptor = HotTool.__new__(HotTool)  # placeholder won't happen normally
             call_args = dict(args)
-            sig = inspect.signature(descriptor.handler)
-            if "_muninn" in sig.parameters:
-                call_args["_muninn"] = self.muninn
-            result = descriptor.handler(**call_args)
-            output = result if isinstance(result, dict) else {"output": result}
-            self._update_hot_tools(tool_id, descriptor)
-            return ToolResult(
-                tool_id    = tool_id,
-                success    = True,
-                output     = output,
-                polarity   = descriptor.polarity,
-                duration_ms = int((time.monotonic() - t0) * 1000),
-            )
-        except Exception as e:
-            return ToolResult(
-                tool_id    = tool_id,
-                success    = False,
-                output     = {},
-                error      = str(e),
-                polarity   = descriptor.polarity,
-                duration_ms = int((time.monotonic() - t0) * 1000),
-            )
+            call_args["query"] = query
+            return {
+                "status": "exact",
+                "descriptor": descriptor,
+                "call_args": call_args,
+                "candidates": [],
+                "reason": f"hot-capability match on {tags}",
+            }
+
+        if len(scored) > 1:
+            candidates = [
+                {
+                    "tool_id": tid,
+                    "title": (hot.title if hasattr(hot, "title") else hot.get("title", tid)),
+                    "overlap": overlap,
+                }
+                for overlap, _, tid, hot in scored
+            ]
+            return {
+                "status": "conflict",
+                "descriptor": None,
+                "call_args": {},
+                "candidates": candidates,
+                "reason": f"{len(scored)} tools match {tags}",
+            }
+
+        # --- Stage 2: LTM recall fallback ------------------------------
+        if self.muninn is not None:
+            try:
+                from memory_module.recall import RecallQuery as _RQ
+                _q = _RQ(
+                    semantic_query=query,
+                    topics=["tool"] + tags,
+                    top_k=5,
+                )
+            except ImportError:
+                _q = f"tool {query} {' '.join(tags)}"
+            try:
+                results = self.muninn.recall(_q, top_k=5)
+            except Exception:
+                results = []
+            matches = []
+            for r in results:
+                try:
+                    data = json.loads(r.entry.content) if hasattr(r, "entry") else json.loads(r)
+                except Exception:
+                    continue
+                tid = data.get("tool_id", data.get("name", ""))
+                if not tid:
+                    continue
+                scope = data.get("permission_scope", [])
+                overlap = [t for t in tags if t in scope]
+                if overlap:
+                    desc = _ltm_content_to_descriptor(data)
+                    self._schema_cache[tid] = desc
+                    matches.append((len(overlap), desc))
+
+            if len(matches) == 1:
+                _, desc = matches[0]
+                call_args = dict(args)
+                call_args["query"] = query
+                return {
+                    "status": "resolved",
+                    "descriptor": desc,
+                    "call_args": call_args,
+                    "candidates": [],
+                    "reason": f"LTM recall resolved {tags}",
+                }
+            if len(matches) > 1:
+                candidates = [
+                    {
+                        "tool_id": d.tool_id,
+                        "title": d.title,
+                        "overlap": o,
+                    }
+                    for o, d in matches
+                ]
+                return {
+                    "status": "conflict",
+                    "descriptor": None,
+                    "call_args": {},
+                    "candidates": candidates,
+                    "reason": f"{len(matches)} LTM candidates for {tags}",
+                }
+
+        return {
+            "status": "unavailable",
+            "descriptor": None,
+            "call_args": {},
+            "candidates": [],
+            "reason": f"no tool found for capability {tags}",
+        }
 
     # ------------------------------------------------------------------
     # Installation (Tier 3 — dynamic staging pipeline)
@@ -358,161 +581,162 @@ class ToolManager:
         Returns the ToolDescriptor for the installed tool.
         Raises InstallError on any failure — caller should log and not flush.
         """
-        tool_id = manifest.tool_id
+        with self._lock:
+            tool_id = manifest.tool_id
 
-        # Step 1: pip dependencies
-        if manifest.dependencies and not skip_dependencies:
-            dep_errors = self._install_dependencies(manifest.dependencies, stm)
-            if dep_errors:
+            # Step 1: pip dependencies
+            if manifest.dependencies and not skip_dependencies:
+                dep_errors = self._install_dependencies(manifest.dependencies, stm)
+                if dep_errors:
+                    stm.record(
+                        source="system", type="internal",
+                        payload={
+                            "subtype":   "tool_install_dep_warning",
+                            "tool_id":   tool_id,
+                            "failures":  dep_errors,
+                        },
+                    )
+                    # Non-fatal: attempt to load anyway (may already be installed)
+
+            # Step 2: load module
+            try:
+                module = self._load_module(manifest.source_path, tool_id)
+            except Exception as e:
+                raise InstallError(f"Module load failed for {tool_id}: {e}") from e
+
+            # Step 3: resolve handler
+            # Provider tools expose complete/stream/etc rather than a single handler.
+            # They have no callable registered in _world — routing goes through
+            # LLMClient._PROVIDERS instead. Use a no-op sentinel.
+            if manifest.mode == "provider" or manifest.direction in ("capture", "process"):
+                # Provider tools expose complete/stream/etc.
+                # Capture tools expose get_queue(); process tools expose push().
+                # None of these use the single-handler dispatch pattern.
+                handler = None   # sentinel — not dispatched via Tool Manager
+            else:
+                handler_name = manifest.handler or "handle"
+                handler = getattr(module, handler_name, None)
+                if handler is None:
+                    fallback_name = tool_id.replace(".", "_").replace("-", "_")
+                    handler = getattr(module, fallback_name, None)
+                if handler is None or not callable(handler):
+                    raise InstallError(
+                        f"No callable '{handler_name}' found in module {manifest.source_path}. "
+                        f"Add a 'def {handler_name}(...)' function or set 'handler:' in manifest."
+                    )
+
+            # Step 4: write LTM descriptor
+            ltm_dict = manifest.to_ltm_dict()
+            ltm_dict["install_state"] = "installed"
+            try:
+                self.muninn.consolidate_ltm(
+                    narrative  = json.dumps(ltm_dict),
+                    class_type = "tool",
+                    topics     = ["tool", tool_id] + manifest.permission_scope,
+                    confidence = 1.0,
+                )
+            except Exception as e:
+                raise InstallError(f"LTM write failed for {tool_id}: {e}") from e
+
+            # Step 5: register in world tier
+            descriptor = ToolDescriptor(
+                tool_id            = tool_id,
+                title              = manifest.title,
+                capability_summary = manifest.capability_summary,
+                polarity           = manifest.polarity,
+                permission_scope   = manifest.permission_scope,
+                inputs             = manifest.inputs,
+                outputs            = manifest.outputs,
+                tier               = "world",
+                source_path        = str(manifest.source_path),
+                handler            = handler,
+                mode               = manifest.mode,
+                direction          = manifest.direction,
+                subscriptions      = manifest.subscriptions,
+                emits              = manifest.emits,
+                consumes           = manifest.consumes,
+            )
+            self._world[tool_id]        = descriptor
+            self._schema_cache[tool_id] = descriptor
+
+            # Step 5b: write manifest state defaults to HTM.states
+            # Each state param is stored as "{tool_id}.{param_name}" = default_value
+            if manifest.states and htm is not None:
+                for param, spec in manifest.states.items():
+                    key     = f"{tool_id}.{param}"
+                    default = spec.get("default") if isinstance(spec, dict) else spec
+                    htm.states.set_default(key, default)
                 stm.record(
                     source="system", type="internal",
                     payload={
-                        "subtype":   "tool_install_dep_warning",
-                        "tool_id":   tool_id,
-                        "failures":  dep_errors,
+                        "subtype":  "tool_states_initialised",
+                        "tool_id":  tool_id,
+                        "keys":     [f"{tool_id}.{p}" for p in manifest.states],
                     },
                 )
-                # Non-fatal: attempt to load anyway (may already be installed)
 
-        # Step 2: load module
-        try:
-            module = self._load_module(manifest.source_path, tool_id)
-        except Exception as e:
-            raise InstallError(f"Module load failed for {tool_id}: {e}") from e
-
-        # Step 3: resolve handler
-        # Provider tools expose complete/stream/etc rather than a single handler.
-        # They have no callable registered in _world — routing goes through
-        # LLMClient._PROVIDERS instead. Use a no-op sentinel.
-        if manifest.mode == "provider" or manifest.direction in ("capture", "process"):
-            # Provider tools expose complete/stream/etc.
-            # Capture tools expose get_queue(); process tools expose push().
-            # None of these use the single-handler dispatch pattern.
-            handler = None   # sentinel — not dispatched via Tool Manager
-        else:
-            handler_name = manifest.handler or "handle"
-            handler = getattr(module, handler_name, None)
-            if handler is None:
-                fallback_name = tool_id.replace(".", "_").replace("-", "_")
-                handler = getattr(module, fallback_name, None)
-            if handler is None or not callable(handler):
-                raise InstallError(
-                    f"No callable '{handler_name}' found in module {manifest.source_path}. "
-                    f"Add a 'def {handler_name}(...)' function or set 'handler:' in manifest."
+            # Step 6: optionally activate as pipeline
+            if activate_pipeline and manifest.perception_capable and htm is not None:
+                # Create a new system HTM pipeline task so the Orchestrator picks it up
+                htm.create(
+                    title        = f"Perception: {manifest.title}",
+                    initiated_by = "system",
+                    persistence  = "persist",
+                    tags         = ["pipeline", "perception", tool_id],
+                    progress     = json.dumps({
+                        "artifact_id":       tool_id,
+                        "active_by_default": True,
+                    }),
+                )
+                stm.record(
+                    source="system", type="internal",
+                    payload={
+                        "subtype": "pipeline_activated",
+                        "tool_id": tool_id,
+                        "title":   manifest.title,
+                    },
                 )
 
-        # Step 4: write LTM descriptor
-        ltm_dict = manifest.to_ltm_dict()
-        ltm_dict["install_state"] = "installed"
-        try:
-            self.muninn.consolidate_ltm(
-                narrative  = json.dumps(ltm_dict),
-                class_type = "tool",
-                topics     = ["tool", tool_id] + manifest.permission_scope,
-                confidence = 1.0,
-            )
-        except Exception as e:
-            raise InstallError(f"LTM write failed for {tool_id}: {e}") from e
+            # Step 7: register as LLM provider if mode="provider"
+            if manifest.mode == "provider":
+                # The module must expose the four standard callables directly.
+                # We build a handler dict from the module's top-level functions.
+                provider_handlers = {}
+                for fn_name in ("complete", "stream", "complete_json", "complete_tools"):
+                    fn = getattr(module, fn_name, None)
+                    if fn and callable(fn):
+                        provider_handlers[fn_name] = fn
+                if provider_handlers:
+                    try:
+                        from huginn.llm.client import LLMClient as _LC
+                        _LC.register_provider(tool_id, provider_handlers)
+                        stm.record(
+                            source="system", type="internal",
+                            payload={"subtype": "provider_registered",
+                                     "tool_id": tool_id,
+                                     "methods": list(provider_handlers)},
+                        )
+                    except Exception as e:
+                        stm.record(
+                            source="system", type="internal",
+                            payload={"subtype": "provider_register_error",
+                                     "tool_id": tool_id, "error": str(e)},
+                        )
 
-        # Step 5: register in world tier
-        descriptor = ToolDescriptor(
-            tool_id            = tool_id,
-            title              = manifest.title,
-            capability_summary = manifest.capability_summary,
-            polarity           = manifest.polarity,
-            permission_scope   = manifest.permission_scope,
-            inputs             = manifest.inputs,
-            outputs            = manifest.outputs,
-            tier               = "world",
-            source_path        = str(manifest.source_path),
-            handler            = handler,
-            mode               = manifest.mode,
-            direction          = manifest.direction,
-            subscriptions      = manifest.subscriptions,
-            emits              = manifest.emits,
-            consumes           = manifest.consumes,
-        )
-        self._world[tool_id]        = descriptor
-        self._schema_cache[tool_id] = descriptor
-
-        # Step 5b: write manifest state defaults to HTM.states
-        # Each state param is stored as "{tool_id}.{param_name}" = default_value
-        if manifest.states and htm is not None:
-            for param, spec in manifest.states.items():
-                key     = f"{tool_id}.{param}"
-                default = spec.get("default") if isinstance(spec, dict) else spec
-                htm.states.set_default(key, default)
+            # Step 8: install-complete STM event
             stm.record(
                 source="system", type="internal",
                 payload={
-                    "subtype":  "tool_states_initialised",
-                    "tool_id":  tool_id,
-                    "keys":     [f"{tool_id}.{p}" for p in manifest.states],
+                    "subtype":             "tool_installed",
+                    "tool_id":             tool_id,
+                    "title":               manifest.title,
+                    "mode":                manifest.mode,
+                    "perception_capable":  manifest.perception_capable,
+                    "pipeline_activated":  activate_pipeline and manifest.perception_capable,
                 },
             )
 
-        # Step 6: optionally activate as pipeline
-        if activate_pipeline and manifest.perception_capable and htm is not None:
-            # Create a new system HTM pipeline task so the Orchestrator picks it up
-            htm.create(
-                title        = f"Perception: {manifest.title}",
-                initiated_by = "system",
-                persistence  = "persist",
-                tags         = ["pipeline", "perception", tool_id],
-                progress     = json.dumps({
-                    "artifact_id":       tool_id,
-                    "active_by_default": True,
-                }),
-            )
-            stm.record(
-                source="system", type="internal",
-                payload={
-                    "subtype": "pipeline_activated",
-                    "tool_id": tool_id,
-                    "title":   manifest.title,
-                },
-            )
-
-        # Step 7: register as LLM provider if mode="provider"
-        if manifest.mode == "provider":
-            # The module must expose the four standard callables directly.
-            # We build a handler dict from the module's top-level functions.
-            provider_handlers = {}
-            for fn_name in ("complete", "stream", "complete_json", "complete_tools"):
-                fn = getattr(module, fn_name, None)
-                if fn and callable(fn):
-                    provider_handlers[fn_name] = fn
-            if provider_handlers:
-                try:
-                    from huginn.llm.client import LLMClient as _LC
-                    _LC.register_provider(tool_id, provider_handlers)
-                    stm.record(
-                        source="system", type="internal",
-                        payload={"subtype": "provider_registered",
-                                 "tool_id": tool_id,
-                                 "methods": list(provider_handlers)},
-                    )
-                except Exception as e:
-                    stm.record(
-                        source="system", type="internal",
-                        payload={"subtype": "provider_register_error",
-                                 "tool_id": tool_id, "error": str(e)},
-                    )
-
-        # Step 8: install-complete STM event
-        stm.record(
-            source="system", type="internal",
-            payload={
-                "subtype":             "tool_installed",
-                "tool_id":             tool_id,
-                "title":               manifest.title,
-                "mode":                manifest.mode,
-                "perception_capable":  manifest.perception_capable,
-                "pipeline_activated":  activate_pipeline and manifest.perception_capable,
-            },
-        )
-
-        return descriptor
+            return descriptor
 
     def _execute_native(self, tool_id: str, args: dict) -> str:
         """
@@ -822,40 +1046,41 @@ class ToolManager:
 
         Returns True if the tool was found and removed, False otherwise.
         """
-        descriptor = self._world.get(tool_id) or self._schema_cache.get(tool_id)
-        if descriptor is None:
-            return False
+        with self._lock:
+            descriptor = self._world.get(tool_id) or self._schema_cache.get(tool_id)
+            if descriptor is None:
+                return False
 
-        # Stop actuation daemon if running
-        if hasattr(self, '_actuation_manager') and self._actuation_manager is not None:
-            try:
-                self._actuation_manager.stop_tool(tool_id)
-            except Exception:
-                pass
+            # Stop actuation daemon if running
+            if hasattr(self, '_actuation_manager') and self._actuation_manager is not None:
+                try:
+                    self._actuation_manager.stop_tool(tool_id)
+                except Exception:
+                    pass
 
-        # Remove from registries
-        self._world.pop(tool_id, None)
-        self._schema_cache.pop(tool_id, None)
+            # Remove from registries
+            self._world.pop(tool_id, None)
+            self._schema_cache.pop(tool_id, None)
 
-        # Unload module from sys.modules
-        module_name = f"huginn_tool_{tool_id.replace('.', '_').replace('-', '_')}"
-        sys.modules.pop(module_name, None)
+            # Unload module from sys.modules
+            module_name = f"huginn_tool_{tool_id.replace('.', '_').replace('-', '_')}"
+            sys.modules.pop(module_name, None)
 
-        # Remove from _modules if present
-        self._modules.pop(tool_id, None)
+            # Remove from _modules if present
+            self._modules.pop(tool_id, None)
 
-        # Write STM event
-        if stm is not None:
-            stm.record(
-                source="system", type="internal",
-                payload={
-                    "subtype":   "tool_uninstalled",
-                    "tool_id":   tool_id,
-                    "source_path": descriptor.source_path,
-                },
-            )
+            # Write STM event
+            if stm is not None:
+                stm.record(
+                    source="system", type="internal",
+                    payload={
+                        "subtype":   "tool_uninstalled",
+                        "tool_id":   tool_id,
+                        "source_path": descriptor.source_path,
+                    },
+                )
 
-        return True
+            return True
 
     def reload_tool(
         self,
@@ -1014,3 +1239,57 @@ def register_tool(muninn, tool_manager: ToolManager, descriptor_dict: dict, hand
     # Register handler with the ToolManager
     descriptor = _ltm_content_to_descriptor(full)
     tool_manager.register(descriptor_dict["tool_id"], handler, descriptor)
+
+
+# ---------------------------------------------------------------------------
+# Action-tag catalogue helper (shared by ToolManager.prepare_capability and
+# Sagax._format_action_tags). Kept here so both consumers import one symbol.
+# ---------------------------------------------------------------------------
+
+def format_action_tags_capped(
+    all_tags:   list[str] | set[str],
+    hot_tags:   list[str] | set[str] = (),
+    budget_chars: int = 200,
+) -> str:
+    """
+    Render the action-tag catalogue within a char budget.
+
+    Ordering: hot-cache tags first (most recently used survive by
+    construction), then the rest alphabetically. When truncated, the
+    output ends with "+N more (use recall() to discover)" so the model
+    knows the arsenal is bigger than the visible slice.
+    """
+    ordered: list[str] = []
+    seen: set = set()
+    for t in sorted(hot_tags or (), key=str.lower):
+        t = (t or "").strip()
+        if t and t not in seen:
+            seen.add(t)
+            ordered.append(t)
+    for t in sorted(all_tags or (), key=str.lower):
+        t = (t or "").strip()
+        if t and t not in seen:
+            seen.add(t)
+            ordered.append(t)
+
+    if not ordered:
+        return "(none yet — tools appear here after first use)"
+
+    full = ", ".join(ordered)
+    if len(full) <= budget_chars:
+        return full
+
+    parts: list[str] = []
+    used = 0
+    for t in ordered:
+        add = (", " if parts else "") + t
+        if used + len(add) > budget_chars:
+            break
+        parts.append(t)
+        used += len(add)
+
+    dropped = len(ordered) - len(parts)
+    if dropped > 0:
+        return ", ".join(parts) + f" +{dropped} more (use recall() to discover)"
+    return ", ".join(parts)
+

@@ -110,6 +110,7 @@ class Exilis:
         self.denoise_engine = DenoiseEngine()
 
         self._last_processed_id: str = ""
+        self._cursor_lock = threading.Lock()   # guards _last_processed_id
         self._running = False
         self._thread:  Optional[threading.Thread] = None
 
@@ -141,7 +142,7 @@ class Exilis:
         Each iteration:
           1. events_pending() — one EXISTS query, < 1 ms, no rows loaded
           2. If nothing new: yield and continue (no inference)
-          3. If new events: batch them, run one triage LLM call
+          3. If new events: claim them atomically, run one triage LLM call
 
         This replaces the fixed-interval sleep. Detection latency is
         now bounded by one EXISTS query instead of the poll interval.
@@ -174,38 +175,63 @@ class Exilis:
                 # Brief pause after error to avoid tight error loops
                 time.sleep(0.01)
 
+    def _claim_events(self) -> list:
+        """
+        Atomically claim the unprocessed event batch and advance the cursor.
+
+        Both the poll loop (_tick) and the push path (on_new_event) run on
+        different threads. Reading and advancing the shared cursor happens
+        under one lock, so every batch is claimed exactly once — no missed
+        wake, no double triage.
+        """
+        with self._cursor_lock:
+            events = self.stm.get_events_after(self._last_processed_id)
+            if events:
+                # Advance cursor regardless of triage outcome
+                self._last_processed_id = events[-1].id
+        return events
+
     def _tick(self):
         """
         One Exilis cycle:
-          1. Get all new events since last processed
+          1. Claim all new events since last processed
           2. If none: sleep and return
           3. Read working context (consN + window)
           4. Make one LLM triage call
           5. Dispatch signal
         """
-        new_events = self.stm.get_events_after(self._last_processed_id)
+        new_events = self._claim_events()
         if not new_events:
             return
 
-        # Advance cursor regardless of triage outcome
-        self._last_processed_id = new_events[-1].id
-
         context      = self.stm.get_stm_window()
         active_tasks = self.htm.query(state="active|paused", initiated_by="sagax")
+
+        # Derive Sagax foreground state from its session task.
+        # 'active'  — Sagax is mid-stream right now → raise interrupt bar
+        # 'paused'  — interrupted mid-cycle → act is fine, interrupt only if critical
+        # 'waiting' — between cycles → normal triage thresholds apply
+        sagax_state = "waiting"
+        for t in active_tasks:
+            if "sagax_session" in (t.tags or []):
+                sagax_state = t.state
+                break
+
+        # Fast pre-LLM checks, both pure Python, both microseconds:
+        #   reflex_match — does new speech match an active skill reflex pattern?
+        #   self_addressed — does new speech mention a self name claim?
+        # These are fed to the triage LLM as weight signals, not hard decisions.
+        reflex_match   = self._check_reflex(new_events)
+        self_addressed = self._check_self_addressed(new_events)
 
         # Denoise new events for context (preserves frequency info)
         cons_n = self.stm.get_cons_n()
         last_ctx_id = cons_n.last_event_id if cons_n else ""
         denoised_events = self.denoise_engine.denoise(new_events, last_ctx_id)
 
-        signal = self._triage(context, active_tasks, denoised_events)
-        if signal is None:
-            return
-
-        if signal.label == TriageLabel.INTERRUPT:
-            self.on_urgent(new_events[-1])
-        elif signal.label == TriageLabel.ACT:
-            self.on_act()
+        signal = self._triage(context, active_tasks, denoised_events,
+                              sagax_state, self_addressed, reflex_match)
+        self._dispatch_signal(signal, new_events[-1])
         # hold → nothing
 
     # ------------------------------------------------------------------
@@ -214,18 +240,31 @@ class Exilis:
 
     def _triage(
         self,
-        context:      dict,
-        active_tasks: list,
-        new_events:   list,
+        context:       dict,
+        active_tasks:  list,
+        new_events:    list,
+        sagax_state:   str  = "waiting",
+        self_addressed: bool = False,
+        reflex_match:   str  = "",
     ) -> TriageSignal:
         """
         One LLM call. Returns a TriageSignal.
         Falls back to TriageLabel.ACT on any failure.
+
+        Exilis sees everything Sagax sees (full context), but must be fast
+        and always in the present. It focuses triage on new events while
+        using the full context for awareness.
         """
+        # Build context with all layers (fading + active + new events)
+        cons_n_text = context.get("cons_n_text") or ""
+
         user_prompt = EXILIS_TRIAGE_USER_v1.format(
-            cons_n_text   = context.get("cons_n_text") or "No prior context (cold start).",
-            active_tasks  = _format_tasks(active_tasks),
-            new_events    = _format_events(new_events),
+            cons_n_text    = cons_n_text or "No prior context (cold start).",
+            active_tasks   = _format_tasks(active_tasks),
+            new_events     = _format_events(new_events),
+            sagax_state    = sagax_state,
+            self_addressed = "yes — name claim matched in speech" if self_addressed else "no",
+            reflex_match   = f"yes — {reflex_match}" if reflex_match else "no",
         )
 
         try:
@@ -249,6 +288,77 @@ class Exilis:
             )
 
     # ------------------------------------------------------------------
+    # Reflex pre-check — fast regex against active skill reflex patterns
+    # ------------------------------------------------------------------
+
+    def _check_reflex(self, new_events: list) -> str:
+        """
+        Fast pre-LLM regex check against active skill reflex patterns.
+        Returns skill_id if matched, empty string otherwise.
+
+        Not a hard classifier — just a weight signal for the triage LLM.
+        """
+        import re as _re
+        reflex_tools = self.htm.asc.get_reflex_tools()
+        if not reflex_tools:
+            return ""
+        for ev in new_events:
+            if ev.type not in ("speech", "text"):
+                continue
+            text = (ev.payload.get("text") or ev.payload.get("content") or "").lower()
+            if not text:
+                continue
+            for t in reflex_tools:
+                try:
+                    if t.reflex_pattern and _re.search(t.reflex_pattern, text, _re.IGNORECASE):
+                        return t.reflex_skill_id or t.tool_id
+                except _re.error:
+                    pass
+        return ""
+
+    def _check_self_addressed(self, new_events: list) -> bool:
+        """
+        Scan new speech/text events for any name claim matching entity-self.
+
+        This is a fast word-level check — not NLP, not embedding similarity.
+        Checks whether any word in incoming speech matches a known self name
+        claim (case-insensitive). Returns True if a match is found.
+
+        Intentionally coarse — false positives are better than misses here.
+        The Exilis LLM triage prompt uses this as a weight signal, not a
+        hard decision. "Sebastian in the kitchen" still only gets act-level
+        attention unless there is also an imperative in the utterance.
+        """
+        # Get self name claims from hot entity cache
+        self_entity = self.htm.asc.hot_entities.get("entity-self")
+        if not self_entity:
+            return False
+        claims = {
+            c.lower().strip()
+            for c in (self_entity.name_claims or [])
+            if c.strip()
+        }
+        if not claims:
+            return False
+
+        # Scan speech and text events only — not sensor data
+        for ev in new_events:
+            if ev.type not in ("speech", "text", "output"):
+                continue
+            text = (
+                ev.payload.get("text") or
+                ev.payload.get("content") or ""
+            ).lower()
+            if not text:
+                continue
+            # Word-level check — avoid substring false positives
+            # ("art" matching "AIDER" in "start the music")
+            words = set(text.replace(",","").replace(".","").replace("?","").split())
+            if claims.intersection(words):
+                return True
+        return False
+
+    # ------------------------------------------------------------------
     # Called directly by Orchestrator (push notification path)
     # ------------------------------------------------------------------
 
@@ -257,20 +367,35 @@ class Exilis:
         Synchronous single-event triage for cases where the Orchestrator
         wants an immediate answer (e.g. tool result arriving mid-Sagax).
         Used when async polling is replaced by push notification.
+
+        Dispatches the triage result itself: every producer of this callback
+        (PerceptionManager, Executor) discards the return value, so returning
+        alone would never raise sagax.signal_act(). Shared cursor advancement is
+        atomic with the poll loop (see _claim_events), guaranteeing exactly
+        one claim per event batch.
         """
-        new_events = self.stm.get_events_after(self._last_processed_id)
+        new_events = self._claim_events()
         if not new_events:
             return None
-        self._last_processed_id = new_events[-1].id
         context      = self.stm.get_stm_window()
         active_tasks = self.htm.query(state="active|paused", initiated_by="sagax")
+        sagax_state  = "waiting"
+        for t in active_tasks:
+            if "sagax_session" in (t.tags or []):
+                sagax_state = t.state
+                break
+        reflex_match   = self._check_reflex(new_events)
+        self_addressed = self._check_self_addressed(new_events)
 
-        # Denoise new events for context
+        # Denoise new events for context (preserves frequency info)
         cons_n = self.stm.get_cons_n()
         last_ctx_id = cons_n.last_event_id if cons_n else ""
         denoised_events = self.denoise_engine.denoise(new_events, last_ctx_id)
 
-        return self._triage(context, active_tasks, denoised_events)
+        signal = self._triage(context, active_tasks, denoised_events,
+                              sagax_state, self_addressed, reflex_match)
+        self._dispatch_signal(signal, new_events[-1])
+        return signal
 
 
 # ---------------------------------------------------------------------------

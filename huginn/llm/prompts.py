@@ -80,6 +80,10 @@ ACTIVE TASKS:
 NEW EVENTS (chronological, full detail):
 {new_events}
 
+SIGNALS:
+  self_addressed: {self_addressed}   — a self name claim appeared in speech
+  reflex_match:   {reflex_match}     — speech matched an active skill reflex
+
 The last event above triggered this check. Classify it.
 """
 

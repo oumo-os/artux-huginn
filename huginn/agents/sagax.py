@@ -26,11 +26,15 @@ Narrator grammar (consumed by Orchestrator):
   <aug_result>        injected by Orchestrator — Sagax reads this inline
   <task_update>       HTM task create/update/complete
   <projection>        structured data sent to UI
+
+Wake: via the Orchestrator's wake queue (Exilis raises, Sagax lowers).
+Signals are queued events — a burst of events coalesces into one wake.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import queue
 import threading
 import time
@@ -53,6 +57,7 @@ from ..llm.sagax_prompts import (
     SAGAX_RESUME_v1,        SAGAX_RESUME_USER_v1,
     SAGAX_STAGE_v1,         SAGAX_STAGE_USER_v1,
     SAGAX_MODE_ROUTER_v1,   SAGAX_MODE_ROUTER_USER_v1,
+    SAGAX_FIRSTWAKE_v1,     SAGAX_FIRSTWAKE_USER_v1,
     NARRATOR_GRAMMAR_REF_v1,
     # Compact instruction artifacts for on-demand injection
     INSTRUCTION_RECALL_COMPACT_v1,
@@ -60,6 +65,10 @@ from ..llm.sagax_prompts import (
     INSTRUCTION_SKILL_COMPACT_v1,
     INSTRUCTION_STATES_COMPACT_v1,
 )
+from ..runtime.tool_manager import format_action_tags_capped
+from ..runtime.context_budget import fit_user_prompt
+
+_log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -91,11 +100,14 @@ class Sagax:
         For submitting tool calls and receiving results.
     entity_id : str
         Confirmed session entity. Empty on cold start.
-    permission_scope : list[str]
-        What this session is allowed to do.
     on_narrator_token : callable(token: str)
         Called with each token from the Narrator stream.
         The Orchestrator provides this and routes tokens in real time.
+    use_mode_routing : bool
+        When True (default), each cycle selects an atomised role-specific
+        system prompt instead of the monolithic SAGAX_PLAN_FULL.
+    max_context_tokens : int
+        Soft cap on user-context tokens per cycle.
     """
 
     MAX_PLAN_STEPS  = 20
@@ -111,6 +123,9 @@ class Sagax:
         "camera", "switch", "change", "enable", "disable", "restart", "list",
     ])
 
+    # Latency budget for the LLM mode router — fast tiny-model call.
+    _MODE_ROUTER_TIMEOUT_S = 1.0
+
     def __init__(
         self,
         stm:                STMStore,
@@ -119,7 +134,7 @@ class Sagax:
         llm:                LLMClient,
         orchestrator,
         entity_id:          str = "",
-        permission_scope:   list[str] = None,
+        permission_scope:   list[str] = None,   # deprecated: grants are entity-bound
         on_narrator_token:  Optional[Callable] = None,
         use_mode_routing:   bool = True,
         max_context_tokens: int  = 800,
@@ -146,7 +161,8 @@ class Sagax:
         self.orchestrator      = orchestrator
         self._orchestrator     = orchestrator
         self.entity_id         = entity_id
-        self.permission_scope  = permission_scope or []
+        # permission_scope removed — grants are entity-bound in HTM.asc.hot_entities
+        # and read by _build_mode_context at context assembly time.
         self.on_narrator_token = on_narrator_token
 
         self.use_mode_routing   = use_mode_routing
@@ -156,8 +172,6 @@ class Sagax:
         self._running  = False
         self._thread:  Optional[threading.Thread] = None
         self._messages: list[dict] = []
-        self._speech_step_var:   str   = ""
-        self._speech_step_event         = None
 
         # Session task — Sagax's own HTM task that tracks agent state
         # across cycles. Created on first cycle, persisted for the session.
@@ -169,8 +183,6 @@ class Sagax:
         self._executor = _cf.ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="SagaxConsN"
         )
-        # Guards the stm._summarise swap/restore so overlapping async
-        # consN jobs cannot clobber each other's summariser.
         self._consn_lock = threading.Lock()
 
     # ------------------------------------------------------------------
@@ -217,50 +229,92 @@ class Sagax:
         """
         One Sagax reasoning cycle.
 
-        When use_mode_routing=True (default):
-          1. Read STM context + HTM tasks
-          2. _select_mode() picks the tightest applicable role prompt
-          3. _build_mode_context() assembles the matching user template
-          4. Stream Narrator response using the mode-specific system prompt
-          5. Update consN if window is large
-
-        When use_mode_routing=False:
-          Falls back to the original monolithic SAGAX_PLAN_FULL prompt.
-          Useful for large models or for A/B comparison.
+        1. Read STM context + HTM tasks
+        2. _select_mode() picks the tightest applicable role prompt
+        3. _build_mode_context() assembles the matching user template
+        4. Stream Narrator response using the mode-specific system prompt
+        5. Update consN if window is large
         """
         context       = self.stm.get_stm_window()
         active_tasks  = self.htm.query(initiated_by="sagax", state="active|paused|due")
         staging_tasks = self.htm.query(tags_any=["tool_staging"], state="waiting")
+        # Attention surface: unacknowledged completions join the context
+        # display (mode selection stays on non-terminal tasks only).
+        display_tasks = self._attention_tasks(active_tasks)
 
         # Reset per-cycle message buffer. Each cycle is a single inference
         # call with fresh context from STM + HTM. Cross-cycle history would
         # duplicate what's already in consN and add stale noise.
-        # Within-cycle injections (aug_result, speech_step) still work —
-        # they append to this list before the stream resumes.
         self._messages = []
 
         # Ensure the session task exists and mark Sagax as active
         self._ensure_session_task()
         self._update_session_task_state("active")
 
+        # First-wake check — intercepts the cycle before mode routing.
+        # Triggered once on first boot when the STM contains a first_wake event.
+        _fw_event = next(
+            (e for e in (context.get("new_events") or [])
+             if e.type == "internal"
+             and e.payload.get("subtype") == "first_wake"),
+            None
+        )
+        if _fw_event:
+            system_prompt, user_prompt = self._build_firstwake_context(_fw_event)
+            self._messages.append({"role": "user", "content": user_prompt})
+            narrator_text = ""
+            try:
+                for chunk in self.llm.stream(
+                    system      = system_prompt,
+                    messages    = self._messages,
+                    temperature = 0.7,   # warmer — this is a greeting
+                ):
+                    narrator_text += chunk.delta
+                    if self.on_narrator_token:
+                        self.on_narrator_token(chunk.delta)
+            except Exception as e:
+                narrator_text = (
+                    "<speech>I seem to have woken up, though something went wrong "
+                    f"during my first words: {e}. "
+                    "Who is there?</speech>"
+                )
+                if self.on_narrator_token:
+                    for ch in narrator_text:
+                        self.on_narrator_token(ch)
+            self._messages.append({"role": "assistant", "content": narrator_text})
+            # Write first-wake to the session notebook
+            try:
+                self._ensure_session_task()
+                self.htm.note(
+                    self._session_task_id,
+                    f"[first_wake] {narrator_text[:200]}"
+                )
+            except Exception as exc:
+                _log.debug("first-wake notebook write failed: %s", exc)
+            self._update_session_task_state("waiting")
+            return
+
         mode = "plan"   # default, overridden below
         if self.use_mode_routing:
             mode = self._select_mode(context, active_tasks, staging_tasks, signal)
             system_prompt, user_prompt = self._build_mode_context(
-                mode, context, active_tasks, staging_tasks
+                mode, context, display_tasks, staging_tasks
             )
         else:
             # Legacy path — original monolithic prompt
             system_prompt = SAGAX_PLAN_FULL
             user_prompt   = SAGAX_PLAN_USER_FULL.format(
                 stm_context      = _format_stm_context(context),
-                active_tasks     = _format_tasks(active_tasks),
+                active_tasks     = _format_tasks(display_tasks),
                 state_snapshot   = self.htm.states.summary(),
                 staging_tools    = _format_staging_tasks(staging_tasks),
                 entity_id        = self.entity_id or "unknown",
-                permission_scope = ", ".join(self.permission_scope) or "none",
+                permission_scope = "(entity-bound)",
             )
 
+        # Narrator grammar reference card — injected into the user turn
+        # (not the system prompt) so every mode has the exact tag syntax.
+        user_prompt = user_prompt + "\n\n" + NARRATOR_GRAMMAR_REF_v1
         self._messages.append({"role": "user", "content": user_prompt})
 
         narrator_text = ""
@@ -288,8 +342,6 @@ class Sagax:
 
         # Write a notebook entry to the session task.
         # This is the per-cycle record Logos reads for intent context.
-        # Python extracts what the model wrote (cycle_note) and adds
-        # structural metadata — mode, event count, task state.
         self._write_session_notebook_entry(
             mode         = mode,
             narrator_text = narrator_text,
@@ -299,8 +351,7 @@ class Sagax:
         self._update_session_task_state("waiting")
 
         # If the model didn't write a <cycle_note>, write a minimal fallback
-        # so the consN feed always has input. Detection is a quick string check
-        # on the already-streamed text — no extra LLM call.
+        # so the consN feed always has input.
         if "<cycle_note>" not in narrator_text:
             self._write_fallback_cycle_note(
                 mode if self.use_mode_routing else "legacy"
@@ -308,7 +359,6 @@ class Sagax:
 
         # Update consN after every cycle using cycle notes as input.
         # Runs async so Exilis can triage the next event immediately.
-        # Skipped only if the model emitted nothing worth compressing.
         if self.stm.event_count_since_cons_n() >= 2:
             self._executor.submit(self._update_cons_n_from_cycle_note)
 
@@ -325,12 +375,15 @@ class Sagax:
     ) -> str:
         """
         Classify the current cycle into one of four modes.
-        All logic is pure Python — zero LLM cost.
+        All logic is pure Python — zero LLM cost, except for the ambiguous
+        case (active tasks + tool-signal words) where a bounded LLM call
+        disambiguates.
 
         Priority order (first match wins):
           urgent signal      → respond  (interrupt, stop mid-speech)
           staging tasks      → stage    (one pending tool confirmation)
           paused task        → resume   (known resume_at step)
+          ambiguous          → LLM router (active tasks + tool signal)
           tool signals       → plan
           simple user query  → respond
           default            → plan
@@ -359,6 +412,16 @@ class Sagax:
             words = set(user_text.split())
             has_tool_signal = bool(words & self._TOOL_SIGNAL_WORDS)
 
+            # Ambiguous case: user mentioned tools AND there are active
+            # tasks. The heuristic can't tell if this is a tool request
+            # buried in conversation or a purely conversational message.
+            # A bounded LLM call disambiguates; fallback to "plan".
+            if active_tasks and has_tool_signal:
+                llm_mode = self._llm_select_mode(context, active_tasks)
+                if llm_mode:
+                    return llm_mode
+                # LLM failed or timed out — fall through to heuristic
+
             # Simple question, no active tasks, no tool words → respond
             if not has_tool_signal and not active_tasks:
                 return "respond"
@@ -370,9 +433,131 @@ class Sagax:
         # 6. Default
         return "plan"
 
+    def _llm_select_mode(self, context: dict, active_tasks: list) -> Optional[str]:
+        """
+        LLM-based mode classification for ambiguous cases only.
+        Returns the mode string or None on failure / timeout.
+        """
+        import concurrent.futures
+
+        try:
+            live_context = context.get("cons_n_text", "")
+            new_events   = context.get("new_events", [])
+            last_event   = ""
+            for e in reversed(new_events):
+                last_event = (
+                    f"{e.source}: "
+                    f"{(e.payload.get('text') or '')[:120]}"
+                )
+                if last_event.strip():
+                    break
+
+            task_summary = "; ".join(
+                f"{t.title[:40]} ({t.state})" for t in active_tasks[:5]
+            ) or "(none)"
+
+            user_prompt = SAGAX_MODE_ROUTER_USER_v1.format(
+                cons_n_snippet   = live_context[:200],
+                last_event       = last_event[:200],
+                active_tasks     = task_summary[:200],
+                entity_id        = self.entity_id or "unknown",
+                permission_scope = "(entity-bound)",
+                injected_instruction = "",
+            )
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(
+                    self.llm.complete,
+                    system      = SAGAX_MODE_ROUTER_v1,
+                    user        = user_prompt,
+                    temperature = 0.0,
+                )
+                response = future.result(timeout=self._MODE_ROUTER_TIMEOUT_S)
+
+            text = (response.text or "").strip().lower()
+            if text in ("respond", "plan", "resume", "stage", "idle"):
+                return text
+        except Exception:
+            pass
+        return None
+
+    # ------------------------------------------------------------------
+    # Action tags — capability vocabulary for action-form tool calls
+    # ------------------------------------------------------------------
+
+    def _format_action_tags(self) -> str:
+        """
+        Compact list of capability tags (unique permission_scope values)
+        across installed and hot tools. Sagax can emit
+        {"action":"TAG","query":"..."} without knowing exact tool ids or
+        schemas — the ToolManager resolver picks the tool.
+
+        Capped to a char budget (state `sagax.action_tags_budget`,
+        default 200) with hot-cache tags first, so the most-used
+        capabilities always survive a growing arsenal.
+        """
+        tags: set = set()
+        hot_tags: set = set()
+        tm = None
+        try:
+            tm = getattr(self, "_orchestrator", None)
+            if tm is not None:
+                tm = getattr(tm, "tool_manager", None)
+        except Exception:
+            tm = None
+        if tm is not None:
+            try:
+                for d in tm.descriptors.values():
+                    for s in (d.permission_scope or []):
+                        if isinstance(s, str) and s.strip():
+                            tags.add(s.strip())
+            except Exception:
+                pass
+        try:
+            for ht in self.htm.asc.get("hot_capabilities").values():
+                scope = ht.permission_scope if hasattr(ht, "permission_scope") \
+                    else ht.get("permission_scope", [])
+                for s in (scope or []):
+                    if isinstance(s, str) and s.strip():
+                        hot_tags.add(s.strip())
+                        tags.add(s.strip())
+        except Exception:
+            pass
+        budget = 200
+        try:
+            budget = int(self.htm.states.get("sagax.action_tags_budget", 0) or 0) or 200
+        except Exception:
+            pass
+        return format_action_tags_capped(tags, hot_tags, budget)
+
     # ------------------------------------------------------------------
     # Mode context builder — assembles system + user prompt for the mode
     # ------------------------------------------------------------------
+
+    def _build_firstwake_context(self, fw_event) -> tuple[str, str]:
+        """
+        Build the first-wake prompt context from the first_wake STM event.
+        Uses SAGAX_FIRSTWAKE_v1 system prompt and SAGAX_FIRSTWAKE_USER_v1
+        user template, both from sagax_prompts.
+        """
+        _self = self.htm.asc.hot_entities.get("entity-self")
+        if _self:
+            _self_name   = _self.name or "Exilis"
+            _other_claims = [c for c in (_self.name_claims or []) if c != _self_name]
+            _aliases      = ", ".join(_other_claims[:5])
+            self_block    = _self_name + (f"  aliases: {_aliases}" if _aliases else "")
+        else:
+            self_block = self.htm.states.get("system.name", "Exilis") or "Exilis"
+
+        payload = fw_event.payload if hasattr(fw_event, "payload") else {}
+        user = SAGAX_FIRSTWAKE_USER_v1.format(
+            datetime_now      = payload.get("datetime", "unknown time"),
+            self_entity_block = self_block,
+            diagnostics       = payload.get("diagnostics", "(none)"),
+            first_events      = payload.get("first_events",
+                             "  (no perception events yet)"),
+        )
+        return SAGAX_FIRSTWAKE_v1, user
 
     def _build_mode_context(
         self,
@@ -386,19 +571,103 @@ class Sagax:
 
         Each user prompt is kept within self.max_context_tokens by
         limiting event history depth and consN snippet length.
+
+        Sagax sees all context layers:
+        - consN (lossy rolling narrative)
+        - Denoised new events (fresh, not yet triaged)
+
+        Capability surfaces: ACTION TAGS only. Tools are resolved by the
+        ToolManager from {"action":"TAG","query":...}; hot-tool inventories
+        are deliberately NOT injected (they are context tax — recall() is
+        the discovery path for specific schemas).
+
+        Entity context: SELF block (name + aliases from entity-self) is
+        injected so Sagax reads its own identity the same way it reads any
+        other entity. Grants are read from the confirmed entity's hot
+        cache (entity-bound, not session-bound).
         """
         entity_id   = self.entity_id or "unknown"
-        grants      = ", ".join(self.permission_scope) or "none"
-        cons_n      = _format_cons_n_snippet(context, self.max_context_tokens // 3)
+        action_tags = self._format_action_tags()
+
+        # SELF entity context — injected as an entity block so Sagax
+        # reads its own identity the same way it reads John or any other
+        # entity. The system prompt says nothing about who Sagax is — it
+        # reads SELF from context just as it reads John.
+        _self = self.htm.asc.hot_entities.get("entity-self")
+        if _self:
+            _self_name    = _self.name or "Exilis"
+            _other_claims = [c for c in (_self.name_claims or []) if c != _self_name]
+            _aliases_str  = f"  aliases: {', '.join(_other_claims[:5])}" if _other_claims else ""
+            self_entity_block = f"SELF: {_self_name}{_aliases_str}"
+        else:
+            _self_name = self.htm.states.get("system.name", "Exilis") or "Exilis"
+            self_entity_block = f"SELF: {_self_name}"
+
+        # Grants from entity hot cache — entity-bound, not session-bound
+        _hot        = self.htm.asc.hot_entities.get(self.entity_id or "")
+        _g          = _hot.grants if _hot else {}
+        grants      = ", ".join(_g.get("permission_scope", [])) or "none (guest)"
+
+        # Build consN snippet with recent events
+        cons_n_snippet = _format_cons_n_snippet(context, self.max_context_tokens // 3)
         recent_evts = _format_recent_events(context, max_events=6)
         state_snap  = _format_state_snapshot_compact(self.htm.states)
 
+        # Tool health diagnostics: a tool failure is a system failure. When
+        # the user names a degraded tool, Sagax has the counters + last error
+        # in context to present with a warning before proceeding.
+        try:
+            vig   = self.htm.asc.summary_for_sagax()
+            caps  = vig.get("capabilities") or []
+            if caps:
+                lines = ["TOOL HEALTH:"]
+                for c in caps:
+                    err = f" last_error={c['last_error'][:60]}" if c.get("last_error") else ""
+                    lines.append(
+                        f"  {c['tool_id']} use={c['use_count']} "
+                        f"fail={c['fail_count']} health={c['health']}{err}"
+                    )
+                state_snap = f"{state_snap}\n" + "\n".join(lines)
+        except Exception:
+            pass
+
+        def _emit_truncated(mode_name: str, bytes_saved: int, layer: str) -> None:
+            try:
+                self.stm.record(
+                    source="system", type="internal",
+                    payload={"subtype": "context_truncated",
+                             "mode": mode_name,
+                             "bytes_saved": bytes_saved,
+                             "layer": layer},
+                )
+            except Exception:
+                pass
+
+        _kw_plan = dict(
+            self_entity_block   = self_entity_block,
+            action_tags         = action_tags,
+            cons_n_snippet      = cons_n_snippet,
+            recent_events       = recent_evts,
+            active_tasks        = _format_tasks(active_tasks),
+            state_snapshot      = state_snap,
+            staging_tools       = _format_staging_tasks(staging_tasks),
+            entity_id           = entity_id,
+            permission_scope    = grants,
+            injected_instruction = self._fetch_compact_instruction("recall"),
+        )
+
         if mode == "respond":
-            user = SAGAX_RESPOND_USER_v1.format(
-                cons_n_snippet   = cons_n,
-                recent_events    = recent_evts,
-                entity_id        = entity_id,
-                permission_scope = grants,
+            _kw = dict(
+                self_entity_block   = self_entity_block,
+                cons_n_snippet      = cons_n_snippet,
+                recent_events       = recent_evts,
+                entity_id           = entity_id,
+                permission_scope    = grants,
+            )
+            user = fit_user_prompt(
+                SAGAX_RESPOND_USER_v1, _kw,
+                self.max_context_tokens * 3, mode,
+                emit_truncated=_emit_truncated,
             )
             return SAGAX_RESPOND_v1, user
 
@@ -406,37 +675,44 @@ class Sagax:
             paused = [t for t in active_tasks if t.state == "paused" and t.resume_at]
             task   = paused[0] if paused else (active_tasks[0] if active_tasks else None)
             instr  = self._fetch_compact_instruction("task")
-            user = SAGAX_RESUME_USER_v1.format(
-                task_block           = _format_task_block(task),
-                recent_events        = recent_evts,
-                state_snapshot       = state_snap,
-                entity_id            = entity_id,
-                permission_scope     = grants,
+            _kw = dict(
+                self_entity_block   = self_entity_block,
+                action_tags         = action_tags,
+                task_block          = _format_task_block(task),
+                recent_events       = recent_evts,
+                state_snapshot      = state_snap,
+                entity_id           = entity_id,
+                permission_scope    = grants,
                 injected_instruction = instr,
+            )
+            user = fit_user_prompt(
+                SAGAX_RESUME_USER_v1, _kw,
+                self.max_context_tokens * 3, mode,
+                emit_truncated=_emit_truncated,
             )
             return SAGAX_RESUME_v1, user
 
         if mode == "stage":
             tool_block = _format_staging_tool_block(staging_tasks[0])
-            user = SAGAX_STAGE_USER_v1.format(
-                staging_tool_block = tool_block,
-                recent_events      = recent_evts,
-                entity_id          = entity_id,
-                permission_scope   = grants,
+            _kw = dict(
+                self_entity_block   = self_entity_block,
+                staging_tool_block  = tool_block,
+                recent_events       = recent_evts,
+                entity_id           = entity_id,
+                permission_scope    = grants,
+            )
+            user = fit_user_prompt(
+                SAGAX_STAGE_USER_v1, _kw,
+                self.max_context_tokens * 3, mode,
+                emit_truncated=_emit_truncated,
             )
             return SAGAX_STAGE_v1, user
 
         # mode == "plan" (default)
-        instr = self._fetch_compact_instruction("recall")
-        user = SAGAX_PLAN_USER_v1.format(
-            cons_n_snippet       = cons_n,
-            recent_events        = recent_evts,
-            active_tasks         = _format_tasks(active_tasks),
-            state_snapshot       = state_snap,
-            staging_tools        = _format_staging_tasks(staging_tasks),
-            entity_id            = entity_id,
-            permission_scope     = grants,
-            injected_instruction = instr,
+        user = fit_user_prompt(
+            SAGAX_PLAN_USER_v1, _kw_plan,
+            self.max_context_tokens * 3, mode,
+            emit_truncated=_emit_truncated,
         )
         return SAGAX_PLAN_v1, user
 
@@ -481,8 +757,8 @@ class Sagax:
                     content = getattr(raw, "content", "")
                     if content:
                         return content
-            except Exception:
-                pass
+            except Exception as exc:
+                _log.debug("LTM prompt recall failed for %s: %s", topic, exc)
 
         return FALLBACK_MAP.get(topic, "")
 
@@ -513,8 +789,6 @@ class Sagax:
         cycle_notes = self._get_cycle_notes_since_last_cons_n()
 
         if cycle_notes:
-            # Cycle notes are already compressed — just fold them in.
-            # Each note is 1–3 sentences, so this is a cheap call.
             notes_text = "\n".join(
                 f"[{n.ts}] {n.payload.get('text', '')}"
                 for n in cycle_notes
@@ -522,7 +796,6 @@ class Sagax:
             new_events_text = notes_text
             source_label    = f"cycle_notes ({len(cycle_notes)} notes)"
         else:
-            # No cycle notes — fall back to raw event compression
             window     = self.stm.get_stm_window()
             raw_events = _denoise_events(window.get("new_events", []))
             if not raw_events:
@@ -633,9 +906,7 @@ class Sagax:
 
         States:
           active   — Sagax is streaming a Narrator response right now.
-                     Exilis: raise the urgent bar, queue act for natural pause.
           waiting  — Between cycles. Safe to wake Sagax normally.
-          paused   — Interrupted mid-cycle by urgent signal.
         """
         if not self._session_task_id:
             return
@@ -713,7 +984,6 @@ class Sagax:
         """
         If the model produced output but no <cycle_note> block, write a
         minimal fallback so the consN feed always has something to work with.
-        Called at the end of _cycle when no cycle_note was detected.
         """
         self.stm.record(
             source="sagax", type="cycle_note",
@@ -745,27 +1015,37 @@ class Sagax:
         return None
 
     # ------------------------------------------------------------------
-    # Convenience: inject an aug_result into the stream
-    # Called by Orchestrator after dispatching aug_call tools
+    # Attention surface (non-terminal + unretired finished tasks)
     # ------------------------------------------------------------------
 
-    def inject_aug_result(self, result: dict):
+    def _attention_tasks(self, active_tasks: list) -> list:
         """
-        Append an <aug_result> to the pending message.
-        Orchestrator calls this after resolving aug_call tools.
-        Sagax's generation resumes after this injection.
+        Attention surface for the cycle: non-terminal tasks plus persist
+        tasks that finished (completed/expired) but have not been retired.
+
+        Tasks are attention state: a completed task whose output has not
+        been communicated, acknowledged, or promoted to LTM stays visible
+        until Sagax retires it (action="retire"). Window overridable via
+        state `sagax.completed_window_days` (default 3).
         """
-        result_text = (
-            f"<aug_result>{json.dumps(result)}</aug_result>"
-        )
-        # Appended to last assistant message (streaming continuation)
-        if self._messages and self._messages[-1]["role"] == "assistant":
-            self._messages[-1]["content"] += result_text
-        else:
-            self._messages.append({
-                "role": "assistant",
-                "content": result_text,
-            })
+        try:
+            raw  = self.htm.states.get("sagax.completed_window_days")
+            days = float(raw) if raw else 3.0
+        except Exception:
+            days = 3.0
+        try:
+            from datetime import datetime, timedelta, timezone
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+            finished = self.htm.query(
+                initiated_by = "sagax",
+                state        = "completed|expired",
+                persistence  = "persist",
+                updated_after = cutoff,
+            )
+        except Exception:
+            finished = []
+        seen = {t.task_id for t in active_tasks}
+        return active_tasks + [t for t in finished if t.task_id not in seen]
 
     # ------------------------------------------------------------------
     # Boot: execute the startup procedure recalled from LTM
@@ -863,47 +1143,6 @@ class Sagax:
         )
 
     # ------------------------------------------------------------------
-    # speech_step: pause/resume Sagax generation for user response
-    # ------------------------------------------------------------------
-
-    def pause_for_speech_step(self, var: str, step_event: "threading.Event"):
-        """
-        Called by Orchestrator when a <speech_step> block closes.
-
-        Records the pending variable name and the event that will be set
-        when the user's response arrives.  Sagax's _cycle() / stream loop
-        must check _speech_step_event before continuing to yield tokens.
-        We use a simple threading.Event stored on self; the Orchestrator's
-        generation thread blocks on it via inject_speech_step_result().
-        """
-        import threading
-        self._speech_step_var   = var
-        self._speech_step_event = step_event   # the same Event the Orchestrator owns
-
-    def inject_speech_step_result(self, var: str, value: str):
-        """
-        Called by Orchestrator after receive_speech_step_response().
-
-        Appends a <speech_step_result> to the assistant message stream
-        so the LLM resumes with the user's answer bound to `var`.
-        The threading.Event has already been set by the Orchestrator before
-        this is called, so generation can continue.
-        """
-        result_text = (
-            f'<speech_step_result var="{var}">{value}</speech_step_result>'
-        )
-        if self._messages and self._messages[-1]["role"] == "assistant":
-            self._messages[-1]["content"] += result_text
-        else:
-            self._messages.append({
-                "role":    "assistant",
-                "content": result_text,
-            })
-        # Clear local state
-        self._speech_step_var   = ""
-        self._speech_step_event = None
-
-    # ------------------------------------------------------------------
     # Direct chat (for tests and minimal setups without the full loop)
     # ------------------------------------------------------------------
 
@@ -932,7 +1171,7 @@ class Sagax:
             state_snapshot   = self.htm.states.summary(),
             staging_tools    = _format_staging_tasks(staging_tasks),
             entity_id        = self.entity_id or "unknown",
-            permission_scope = ", ".join(self.permission_scope) or "none",
+            permission_scope = "(entity-bound)",
             injected_instruction = "",
         )
 
@@ -1060,11 +1299,6 @@ def _denoise_events(events: list, window_s: float = 30.0) -> list:
     Collapse runs of near-identical events into a single representative
     entry with a count and duration, before they reach context or consN.
 
-    Why this matters: ambient sensor tools (motion, audio events) can fire
-    many similar events in a short window. Without denoising, a 6-event
-    context budget can be entirely consumed by 6 duplicate "motion_detected"
-    entries, leaving no room for the one event that actually matters.
-
     Two events are considered duplicates if they share source, type, and
     subtype/label, and fall within window_s of each other. The collapsed
     entry keeps the most recent payload and timestamp, with a count and
@@ -1095,11 +1329,7 @@ def _denoise_events(events: list, window_s: float = 30.0) -> list:
     for e in events:
         if collapsed and _key(collapsed[-1]) == _key(e) and \
            (_ts(e) - _ts(collapsed[-1])) <= window_s:
-            # Extend the current run — replace with the newer event,
-            # but remember how many were folded in.
             run_count += 1
-            # Copy the event so the live STMEvent (shared via get_stm_window)
-            # is never mutated — events[] is ground truth and must stay intact.
             merged = STMEvent(
                 id=e.id, ts=e.ts, source=e.source, type=e.type,
                 payload=dict(e.payload), confidence=e.confidence,
@@ -1208,4 +1438,3 @@ def _format_staging_tool_block(task) -> str:
         f"  dependencies:       {deps}",
     ]
     return "\n".join(lines)
-

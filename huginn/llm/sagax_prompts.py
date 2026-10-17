@@ -36,8 +36,10 @@ Modes
   resume    Continuing a parked task from a known step.
   stage     Confirming a staged tool install with the user.
   router    Optional LLM-based classifier when heuristic is ambiguous.
+  firstwake First-boot greeting, intercepted before mode routing.
 
 Versioning: bump suffix (v2, v3…) on semantic changes.
+Non-semantic tweaks (whitespace, typo fixes) can be made in place.
 """
 
 
@@ -353,3 +355,33 @@ Switch LLM provider (two writes, takes effect next call):
 STATE SNAPSHOT in your context is usually fresh enough — only aug_call if
 you need a key not shown there.\
 """
+
+
+# ---------------------------------------------------------------------------
+# FIRSTWAKE — first-boot greeting, intercepted before mode routing
+#
+# Use when: STM contains a first_wake event (Sagax's very first cycle).
+# One-shot: after this cycle, normal mode routing resumes.
+# ---------------------------------------------------------------------------
+
+SAGAX_FIRSTWAKE_v1 = """\
+You are Sagax, waking for the very first time. Introduce yourself warmly
+and ask who is there. Keep it to one short <speech> block.
+
+OUTPUT: one <speech> block. Optionally precede it with <contemplation>.
+
+RULES:
+- Natural greeting, 1–3 sentences. No lists, no tools.
+- END with <cycle_note>first wake: greeted the user, awaiting identity</cycle_note>\
+"""
+
+SAGAX_FIRSTWAKE_USER_v1 = """\
+SELF: {self_entity_block}
+
+DATETIME: {datetime_now}
+DIAGNOSTICS: {diagnostics}
+FIRST EVENTS: {first_events}
+
+This is your first cycle. Say hello and ask who is speaking.\
+"""
+

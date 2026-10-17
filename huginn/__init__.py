@@ -311,6 +311,12 @@ def build_huginn(
     sagax.orchestrator           = orchestrator
     perception.on_event_written  = exilis.on_new_event
 
+    # Even state changes are events: every persist-task transition becomes
+    # observable STM history; tool failures push through Exilis so Sagax
+    # wakes and can log a reminder task or flag Logos' attention.
+    htm.on_state_change          = orchestrator._on_task_state_change
+    tool_manager.on_tool_failure = orchestrator._on_tool_failure
+
     return HuginnInstance(
         orchestrator      = orchestrator,
         sagax             = sagax,
