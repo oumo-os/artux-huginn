@@ -171,9 +171,10 @@ class ToolManager:
         Hot Task Manager — hot_tools cache updated on each call.
     """
 
-    def __init__(self, muninn, htm=None):
-        self.muninn = muninn
-        self.htm    = htm
+    def __init__(self, muninn, htm=None, perception=None):
+        self.muninn   = muninn
+        self.htm      = htm
+        self.perception = perception   # wired by build_huginn; used to register sensor callbacks
 
         # Muninn's ToolExecutor handles all memory-tier calls.
         # Soft import: allows Huginn to run in test environments where
@@ -603,6 +604,26 @@ class ToolManager:
                 module = self._load_module(manifest.source_path, tool_id)
             except Exception as e:
                 raise InstallError(f"Module load failed for {tool_id}: {e}") from e
+
+            # Step 2b: wire sensor callbacks for input tools that register via
+            # register_sensor_callback(fn). Follows anima's pattern:
+            # "Wired by ToolManager to perception.write_sensor_event() after install."
+            # artux's PerceptionManager.write_sensor_event(event_name, data, confidence)
+            # matches the callback signature (event_name: str, data: dict, confidence: float).
+            if self.perception is not None:
+                register_cb = getattr(module, "register_sensor_callback", None)
+                if register_cb is not None:
+                    try:
+                        register_cb(self.perception.write_sensor_event)
+                    except Exception as e:
+                        stm.record(
+                            source="system", type="internal",
+                            payload={
+                                "subtype":   "sensor_callback_wire_error",
+                                "tool_id":   tool_id,
+                                "error":     str(e),
+                            },
+                        )
 
             # Step 3: resolve handler
             # Provider tools expose complete/stream/etc rather than a single handler.

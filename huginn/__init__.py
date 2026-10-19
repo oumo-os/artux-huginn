@@ -254,6 +254,12 @@ def build_huginn(
         sig_threshold    = 0.88,
     )
 
+    # Wire PerceptionManager into ToolManager so input tools (e.g. motion
+    # sensor) can register their sensor callback to write_sensor_event()
+    # after install. Follows anima's pattern:
+    # "Wired by ToolManager to perception.write_sensor_event() after install."
+    tool_manager.perception = perception
+
     # All three agents share the same fallback LLM config at boot.
     # Orchestrator.start() recalls artux.config.llm.* from Muninn and
     # calls reconfigure() on each client with the appropriate role config.
